@@ -1,0 +1,8 @@
+# Artefactos de compilación y salidas locales
+/build/
+/build-*/
+/capturas/
+__pycache__/
+*.o
+*.d
+*.gcda
