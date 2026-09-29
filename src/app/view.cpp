@@ -127,7 +127,12 @@ void View::defaults_for(const Sim& sim) {
     // alerones y difusor. En el ala libre los torbellinos de punta están en ~20-50.)
     // Cuerpos (revisión): con 60 el ruido de escala de red del campo lejano (ν = 1e-4) llenaba TODO el dominio
     // de manchas (Ahmed, rápida, 3 PF); con 800 quedan motas sueltas y el cuerpo visible.
-    vs.q_threshold = I.kind == models::Kind::F1Car ? 600.0f : (I.kind == models::Kind::Wing ? 30.0f : 800.0f);
+    // (Ruido del campo lejano corregido, docs/FISICA.md §1.5) El dominio ya no se llena de motas: 300 en coches y 400 en
+    // cuerpos dejan ver los torbellinos de ruedas, alerones y estela (capturas en build/app/shots/noise/). Queda algo de
+    // ruido de escala de red dentro de la capa de ~8 celdas junto a los cuerpos (colisión de 2º orden, ver
+    // lbm::Config::rr_wall_layer): con 150-200 en coches, 10-20 en alas o 150 en el Ahmed aparece como motas pegadas a
+    // la superficie; en alas libres se mantiene 30 por eso.
+    vs.q_threshold = I.kind == models::Kind::F1Car ? 300.0f : (I.kind == models::Kind::Wing ? 30.0f : 400.0f);
     dirty = true;
     rakes_dirty = true;
     surf_colored = SurfMode::Count;

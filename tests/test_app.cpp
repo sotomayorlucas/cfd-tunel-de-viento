@@ -437,7 +437,9 @@ static void test_app_frames() {
         // Calentamiento: los búferes de la UI y de flowvis/raster crecen (×1.5, amortizado) hasta su
         // tamaño de régimen: el humo tarda en llenarse (vivas = emisión × vida) y las líneas se
         // alargan mientras el flujo se desarrolla. Régimen = el humo dejó de crecer Y 25 cuadros
-        // seguidos sin ninguna asignación (máx. 400 cuadros).
+        // seguidos sin ninguna asignación (máx. 400 cuadros). (Ruido del campo lejano corregido: con el flujo limpio el
+        // humo del F1 2022 aún crecía despacio tras 25 cuadros tranquilos y un búfer de draw_points crecía una vez más en
+        // la ventana medida; se exigen 60 cuadros seguidos sin asignaciones.)
         app.view.vs.smoke_speed = 8.0f;
         app.view.dirty = true;
         usize alive_prev = 0;
@@ -445,7 +447,7 @@ static void test_app_frames() {
         int nwarm = 0;
         long warm_allocs = 0;
         const double tw = now_sec();
-        for (; nwarm < 400 && (stable < 25 || quiet < 25); ++nwarm) {
+        for (; nwarm < 400 && (stable < 25 || quiet < 60); ++nwarm) {
             g_allocs.store(0);
             g_count_allocs.store(true);
             app.frame(8, true);

@@ -124,36 +124,68 @@ V wall_omc(V u2, V tau0, V C3, V omc_s, V ff) {
 }
 
 template <class V, class Ld, class St>
-void collide(bool reg, float Sc, const Ld& ld, const St& st, V drho, V rho, V ux, V uy, V uz, const Neq<V>& q, V omc) {
+void collide(bool reg, bool rr, float Sc, const Ld& ld, const St& st, V drho, V rho, V ux, V uy, V uz, const Neq<V>& q, V omc, V omcb, V om3) {
     const V ux3 = V(3.0f) * ux, uy3 = V(3.0f) * uy, uz3 = V(3.0f) * uz;
     const V c3 = -fma(ux3, ux, fma(uy3, uy, uz3 * uz));
     const V hr = V(0.5f) * rho;
     const float W0 = L::w[0] * Sc, W1 = L::w[1] * Sc, W2 = L::w[7] * Sc;
     const V r1 = V(W1) * rho, h1 = V(W1) * hr, d1 = V(W1) * drho;
     const V r2 = V(W2) * rho, h2 = V(W2) * hr, d2 = V(W2) * drho;
-    if (reg) {
+    if (reg || rr) {
+        // Traza de Π^neq (volumen) relajada con omcb, plegada en el término constante (= solver.cpp collide).
         const V mxx = V(4.5f) * q.xx, myy = V(4.5f) * q.yy, mzz = V(4.5f) * q.zz;
         const V mxy = V(9.0f) * q.xy, mxz = V(9.0f) * q.xz, myz = V(9.0f) * q.yz;
         const V trm = (mxx + myy + mzz) * V(1.0f / 3.0f);
         const V rx = mxx - trm, ry = myy - trm, rz = mzz - trm;
-        auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW) {
-            const V t = fma(hW, fma(a, a, c3), dW);
-            const V ra = rW * a;
-            const V pr = V(W) * R;
-            st(i, fma(omc, pr, t + ra));
-            st(i + 1, fma(omc, pr, t - ra));
-        };
-        st(0, fma(omc, V(-W0) * trm, V(W0) * fma(hr, c3, drho)));
-        pair(1, ux3, rx, W1, r1, h1, d1);
-        pair(3, uy3, ry, W1, r1, h1, d1);
-        pair(5, uz3, rz, W1, r1, h1, d1);
-        const V rxy = rx + myy, rxz = rx + mzz, ryz = ry + mzz;
-        pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2);
-        pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2);
-        pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2);
-        pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2);
-        pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2);
-        pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2);
+        const V tb = omcb * trm;
+        const V d2b = fma(V(W2), tb, d2);
+        st(0, fma(-V(W0), tb, V(W0) * fma(hr, c3, drho)));
+        const V rxy = rx + ry, rxz = rx + rz, ryz = ry + rz;
+        if (!rr) {
+            auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW) {
+                const V t = fma(hW, fma(a, a, c3), dW);
+                const V ra = rW * a;
+                const V pr = V(W) * R;
+                st(i, fma(omc, pr, t + ra));
+                st(i + 1, fma(omc, pr, t - ra));
+            };
+            pair(1, ux3, rx, W1, r1, h1, d1);
+            pair(3, uy3, ry, W1, r1, h1, d1);
+            pair(5, uz3, rz, W1, r1, h1, d1);
+            pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2b);
+            pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2b);
+            pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2b);
+            pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2b);
+            pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2b);
+            pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2b);
+        } else {
+            // Regularización recursiva: no equilibrio de 3er orden reconstruido de Π^neq, forma par ± impar
+            // (= solver.cpp collide, Collision::Recursive).
+            const V ux2 = ux + ux, uy2 = uy + uy, uz2 = uz + uz;
+            const V k9 = V(9.0f * W2);
+            const V nxxy = k9 * fma(ux2, q.xy, uy * q.xx), nxyy = k9 * fma(uy2, q.xy, ux * q.yy);
+            const V nxzz = k9 * fma(uz2, q.xz, ux * q.zz), nxxz = k9 * fma(ux2, q.xz, uz * q.xx);
+            const V nyzz = k9 * fma(uz2, q.yz, uy * q.zz), nyyz = k9 * fma(uy2, q.yz, uz * q.yy);
+            auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW, V p3) {
+                const V t = fma(hW, fma(a, a, c3), dW);
+                const V ra = rW * a;
+                const V pr = V(W) * R;
+                const V E = fma(omc, pr, t);
+                const V O = fma(om3, p3, ra);
+                st(i, E + O);
+                st(i + 1, E - O);
+            };
+            const V m2 = V(-2.0f);
+            pair(1, ux3, rx, W1, r1, h1, d1, m2 * (nxyy + nxzz));
+            pair(3, uy3, ry, W1, r1, h1, d1, m2 * (nxxy + nyzz));
+            pair(5, uz3, rz, W1, r1, h1, d1, m2 * (nyyz + nxxz));
+            pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2b, nxxy + nxyy);
+            pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2b, nxzz + nxxz);
+            pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2b, nyzz + nyyz);
+            pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2b, nxyy - nxxy);
+            pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2b, nxzz - nxxz);
+            pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2b, nyzz - nyyz);
+        }
     } else {
         auto pair = [&](int i, V a, V rW, V hW, V dW) {
             const V fi = ld(i), fj = ld(i + 1);
@@ -254,7 +286,7 @@ namespace {
 
 struct StepRes {   // recursos comunes de los kernels de celdas
     Buf flags, sid, mac, mot, par, bad;
-    F u_in, rr, ug, K, C3, floor_;
+    F u_in, rr, ug, K, C3, floor_, omcb;
 };
 
 StepRes step_resources(Kernel& k, bool macro) {
@@ -270,6 +302,7 @@ StepRes step_resources(Kernel& k, bool macro) {
     const U pb = U(kParamHeader) + step * U(kParamPerStep);
     r.u_in = k.ldf(r.par, pb + U(kSUin)); r.rr = k.ldf(r.par, pb + U(kSR)); r.ug = k.ldf(r.par, pb + U(kSUg));
     r.K = k.ldf(r.par, U(kPK)); r.C3 = k.ldf(r.par, U(kPWallC3)); r.floor_ = k.ldf(r.par, U(kPWallFloor));
+    r.omcb = k.ldf(r.par, U(kPOmcb));
     return r;
 }
 
@@ -391,7 +424,10 @@ std::vector<u32> gen_step_single(const Spec& s, int p, bool macro) {
         const Tau T = tau_at(k, R.par, x, s.nx);
         F omc = select(R.K > F(0.0f), one_minus_omega<F>(q, inv, T.t0, T.t0sq, R.K), T.om0);
         if (s.wall) omc = select(bit(fl, 6), wall_omc<F>(fma(ux, ux, fma(uy, uy, uz * uz)), T.t0, R.C3, omc, R.floor_), omc);
+        const F omcb = select(eq, F(0.0f), s.bulk ? R.omcb : omc);
         omc = select(eq, F(0.0f), omc);
+        // Capa junto a los cuerpos (bit interno 7 = solver.cpp kLayer): sin el término de 3er orden de la RR.
+        const F om3 = select(bit(fl, 7), F(0.0f), omc);
         vbad.set((ngt(rho, F(0.2f)) || nlt(rho, F(5.0f))) && !solid);
         if (macro) {
             // Sólidos: ρ = 1 y u = velocidad de su pared (= macro_solid / block_skip_macro).
@@ -415,7 +451,7 @@ std::vector<u32> gen_step_single(const Spec& s, int p, bool macro) {
             auto ld = [&](int i) { return fv[i]; };
             // La población i se escribe en la ubicación de la opuesta (conjunto de acceso de Esoteric-Pull).
             auto st = [&](int i, F v) { const int o = L::opp[i]; k.stf(d[o], odd(o) ? n1 : n, v); };
-            collide<F>(s.regularized, Sc, ld, st, drho, rho, ux, uy, uz, q, omc);
+            collide<F>(s.regularized, s.rr, Sc, ld, st, drho, rho, ux, uy, uz, q, omc, omcb, om3);
         });
     });
     k.if_(k.sg_any(vbad.get()), [&] { k.if_(k.sg_elect(), [&] { k.atomic_or(R.bad, U(0u), U(1u)); }); });
@@ -542,7 +578,9 @@ std::vector<u32> gen_step_pair(const Spec& s, int p, bool macro) {
         F2 omc = select(B2{kpos, kpos}, one_minus_omega<F2>(q, inv, t0, t0sq, F2(R.K, R.K)), om0);
         if (s.wall)
             omc = select(B2{bit(flA, 6), bit(flB, 6)}, wall_omc<F2>(fma(ux, ux, fma(uy, uy, uz * uz)), t0, F2(R.C3, R.C3), omc, F2(R.floor_, R.floor_)), omc);
+        const F2 omcb = select(eq, zero, s.bulk ? F2(R.omcb, R.omcb) : omc);
         omc = select(eq, zero, omc);
+        const F2 om3 = select(B2{bit(flA, 7), bit(flB, 7)}, zero, omc);   // capa junto a los cuerpos (kLayer)
         const B badA = (ngt(rho.a, F(0.2f)) || nlt(rho.a, F(5.0f))) && !solid.a;
         const B badB = (ngt(rho.b, F(0.2f)) || nlt(rho.b, F(5.0f))) && !solid.b;
         vbad.set(badA || badB);
@@ -579,24 +617,24 @@ std::vector<u32> gen_step_pair(const Spec& s, int p, bool macro) {
         if (one_collide) {
             // UNA sola copia de la colisión (código más corto: medido +x % frente a 3 copias): cada población se
             // escribe empaquetada si el par es fluido y, si no, sólo en la mitad de la celda fluida.
-            collide<F2>(s.regularized, Sc, ld, [&](int i, F2 v) {
+            collide<F2>(s.regularized, s.rr, Sc, ld, [&](int i, F2 v) {
                 const int j = L::opp[i];
                 if (pure) { store2(j, v.a, v.b); return; }
                 k.if_else(both, [&] { store2(j, v.a, v.b); }, [&] {
                     k.if_(!solid.a, [&] { store1(j, nA, v.a); });
                     k.if_(!solid.b, [&] { store1(j, nB, v.b); });
                 });
-            }, drho, rho, ux, uy, uz, q, omc);
+            }, drho, rho, ux, uy, uz, q, omc, omcb, om3);
         } else {
             k.if_else(both, [&] {
-                collide<F2>(s.regularized, Sc, ld, [&](int i, F2 v) { store2(L::opp[i], v.a, v.b); }, drho, rho, ux, uy, uz, q, omc);
+                collide<F2>(s.regularized, s.rr, Sc, ld, [&](int i, F2 v) { store2(L::opp[i], v.a, v.b); }, drho, rho, ux, uy, uz, q, omc, omcb, om3);
             }, [&] {
                 if (pure) return;
                 k.if_(!solid.a, [&] {
-                    collide<F2>(s.regularized, Sc, ld, [&](int i, F2 v) { store1(L::opp[i], nA, v.a); }, drho, rho, ux, uy, uz, q, omc);
+                    collide<F2>(s.regularized, s.rr, Sc, ld, [&](int i, F2 v) { store1(L::opp[i], nA, v.a); }, drho, rho, ux, uy, uz, q, omc, omcb, om3);
                 });
                 k.if_(!solid.b, [&] {
-                    collide<F2>(s.regularized, Sc, ld, [&](int i, F2 v) { store1(L::opp[i], nB, v.b); }, drho, rho, ux, uy, uz, q, omc);
+                    collide<F2>(s.regularized, s.rr, Sc, ld, [&](int i, F2 v) { store1(L::opp[i], nB, v.b); }, drho, rho, ux, uy, uz, q, omc, omcb, om3);
                 });
             });
         }

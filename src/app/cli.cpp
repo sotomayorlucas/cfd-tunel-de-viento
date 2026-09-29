@@ -74,7 +74,7 @@ void print_usage(const char* argv0) {
         "                             noarrows, comp-arrows, slice-x|slice-y|slice-z[=pos_m], noslice,\n"
         "                             q=speed|ux|uz|cp|cp0|vort|q, slice-range=a:b, opacity=f, lic,\n"
         "                             rake=vertical|floor|tips|grid, smoke-rake=..., lines=N, line-cp,\n"
-        "                             q-threshold=f (Q·L²/U²; defecto 600 coche, 30 ala, 800 cuerpo), cp-range=a:b, nowire, nossao,\n"
+        "                             q-threshold=f (Q·L²/U²; defecto 300 coche, 30 ala, 400 cuerpo), cp-range=a:b, nowire, nossao,\n"
         "                             nofxaa, nolegends, novortex, nosmoke, noprobe\n"
         "  --panel a,b                secciones abiertas: modelo,config,tunel,vis,resultados,barrido,rendimiento|todo\n"
         "  --shot out.png             captura PNG completa (con la UI) al terminar\n"

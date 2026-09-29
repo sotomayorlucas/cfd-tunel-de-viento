@@ -53,7 +53,7 @@ struct RefLBM {
     int nx = 0, ny = 0, nz = 0;
     i64 N = 0;
     std::vector<double> A, B;             // post-colisión: A = paso anterior, B = nuevo
-    std::vector<u8> type, sid, nearwall;
+    std::vector<u8> type, sid, nearwall, layer;
     std::vector<double> rho, ux, uy, uz;  // macro del último paso
     std::vector<double> tau0;
     WallMotion motion[256];
@@ -123,6 +123,26 @@ struct RefLBM {
             f[k] = L::wd[k] * r * (1 + 3 * cu + 4.5 * cu * cu - 1.5 * uu);
         }
     }
+    // Término de 3er orden de Hermite que D3Q19 soporta, escrito de forma GENÉRICA (independiente de la versión
+    // por direcciones del solver): H_abc(c) = c_a c_b c_c − c_s²(c_a δ_bc + c_b δ_ac + c_c δ_ab) y los 3 pares
+    // (xxy, yzz), (xzz, xyy), (yyz, xxz) con 1/(2c_s⁶) para la suma y 1/(6c_s⁶) para la diferencia.
+    static void f3(const double a3[3][3][3], double* f) {
+        static const int P[3][2][3] = {{{0, 0, 1}, {1, 2, 2}}, {{0, 2, 2}, {0, 1, 1}}, {{1, 1, 2}, {0, 0, 2}}};
+        const double cs2 = 1.0 / 3.0;
+        for (int k = 0; k < L::Q; ++k) {
+            auto H = [&](const int* i) {
+                const double c0 = L::c[k][i[0]], c1 = L::c[k][i[1]], c2 = L::c[k][i[2]];
+                return c0 * c1 * c2 - cs2 * (c0 * (i[1] == i[2]) + c1 * (i[0] == i[2]) + c2 * (i[0] == i[1]));
+            };
+            double v = 0;
+            for (int p = 0; p < 3; ++p) {
+                const double h1 = H(P[p][0]), h2 = H(P[p][1]);
+                const double a1 = a3[P[p][0][0]][P[p][0][1]][P[p][0][2]], a2 = a3[P[p][1][0]][P[p][1][1]][P[p][1][2]];
+                v += (h1 + h2) * (a1 + a2) / (2 * cs2 * cs2 * cs2) + (h1 - h2) * (a1 - a2) / (6 * cs2 * cs2 * cs2);
+            }
+            f[k] = L::wd[k] * v;
+        }
+    }
     void init(const Config& c, const u8* user_sid, const WallMotion* mot, const bool* mv) {
         cfg = c; nx = c.nx; ny = c.ny; nz = c.nz; N = static_cast<i64>(nx) * ny * nz;
         for (int i = 0; i < 256; ++i) { motion[i] = mot[i]; moving[i] = mv[i]; }
@@ -150,6 +170,30 @@ struct RefLBM {
                 nu = cfg.nu + (numax - cfg.nu) * s * s;
             }
             tau0[x] = 3 * nu + 0.5;
+        }
+        // Capa junto a los cuerpos de la colisión recursiva (Config::rr_wall_layer): celdas a distancia de Chebyshev ≤ L
+        // de un sólido que no es el suelo, extendida a bloques de 8 en x (fuerza bruta, independiente del solver).
+        layer.assign(N, 0);
+        if (cfg.collision == Collision::Recursive && cfg.rr_wall_layer > 0) {
+            const int Lw = cfg.rr_wall_layer;
+            std::vector<u8> nearb(N, 0);
+            for (int z = 0; z < nz; ++z)
+                for (int y = 0; y < ny; ++y)
+                    for (int x = 0; x < nx; ++x) {
+                        const i64 n = idx(x, y, z);
+                        if (type[n] != SOLID || (sid[n] == 255 && z == 0)) continue;
+                        for (int dz = -Lw; dz <= Lw; ++dz)
+                            for (int dy = -Lw; dy <= Lw; ++dy)
+                                for (int dx = -Lw; dx <= Lw; ++dx) {
+                                    const int xx = x + dx, yy = y + dy, zz = z + dz;
+                                    if (xx >= 0 && yy >= 0 && zz >= 0 && xx < nx && yy < ny && zz < nz) nearb[idx(xx, yy, zz)] = 1;
+                                }
+                    }
+            for (i64 b = 0; b < N / 8; ++b) {
+                bool any = false;
+                for (int l = 0; l < 8; ++l) any |= nearb[8 * b + l] != 0;
+                if (any) for (int l = 0; l < 8; ++l) layer[8 * b + l] = 1;
+            }
         }
         // Celdas de fluido junto a una pared FIJA y sin vecinos móviles (kNearWall del solver).
         nearwall.assign(N, 0);
@@ -223,6 +267,8 @@ struct RefLBM {
                     pu[0] = cur[0]; pu[1] = cur[1]; pu[2] = cur[2];
                     double fe[19];
                     feq(r, u[0], u[1], u[2], fe);
+                    // Regularización recursiva: equilibrio de 2º orden y no equilibrio de 3er orden reconstruido de Π^neq.
+                    const bool rr = cfg.collision == Collision::Recursive;
                     double post[19];
                     if (eq) {
                         for (int k = 0; k < 19; ++k) post[k] = fe[k];
@@ -238,15 +284,28 @@ struct RefLBM {
                         // (v2) Modelo Slip: Smagorinsky amortiguado en la 1.ª celda junto a paredes fijas.
                         if (cfg.wall_model == WallModel::Slip && nearwall[n]) tau = std::fmax(t0, 0.5 + 0.25 * (tau - 0.5));
                         const double om = 1.0 / tau;
+                        // Viscosidad de volumen: la traza de Π^neq se relaja con ω_b (0 → la ω de la cortante).
+                        const double omb = cfg.bulk_omega > 0 ? static_cast<double>(cfg.bulk_omega) : om;
+                        const double tr = Pi[0][0] + Pi[1][1] + Pi[2][2];
+                        double f3n[19] = {};
+                        if (rr && !layer[n]) {   // no equilibrio de 3er orden recursivo (fuera de la capa junto a los cuerpos): a3neq_abc = u_a Π_bc + u_b Π_ac + u_c Π_ab
+                            double a3[3][3][3];
+                            for (int a = 0; a < 3; ++a)
+                                for (int b = 0; b < 3; ++b)
+                                    for (int d = 0; d < 3; ++d) a3[a][b][d] = u[a] * Pi[b][d] + u[b] * Pi[a][d] + u[d] * Pi[a][b];
+                            f3(a3, f3n);
+                        }
                         for (int k = 0; k < 19; ++k) {
                             if (cfg.collision == Collision::BGK) {
                                 post[k] = fin[k] - om * (fin[k] - fe[k]);
                             } else {
-                                double qp = 0;
+                                double qd = 0;   // Q_k : Π_dev
                                 for (int a = 0; a < 3; ++a)
                                     for (int b = 0; b < 3; ++b)
-                                        qp += (L::c[k][a] * L::c[k][b] - (a == b ? 1.0 / 3.0 : 0.0)) * Pi[a][b];
-                                post[k] = fe[k] + (1 - om) * L::wd[k] * 4.5 * qp;
+                                        qd += (L::c[k][a] * L::c[k][b] - (a == b ? 1.0 / 3.0 : 0.0)) * (Pi[a][b] - (a == b ? tr / 3 : 0.0));
+                                const double c2 = L::c[k][0] * L::c[k][0] + L::c[k][1] * L::c[k][1] + L::c[k][2] * L::c[k][2];
+                                const double qt = (c2 - 1.0) * tr / 3;   // Q_k : (tr/3) I
+                                post[k] = fe[k] + L::wd[k] * 4.5 * ((1 - om) * qd + (1 - omb) * qt) + (1 - om) * f3n[k];
                             }
                         }
                     }
@@ -346,8 +405,10 @@ static void test_lattice() {
 //  2. Esoteric-Pull vs referencia A-B
 // ---------------------------------------------------------------------------------------------
 static void run_reference_case(const char* name, Collision coll, float cs, GroundMode ground, Precision prec, double tol,
-                               int ramp, bool interior255 = false, bool interp = false) {
+                               int ramp, bool interior255 = false, bool interp = false, float bulk = 1.0f, int layer = 8) {
     Config c;
+    c.bulk_omega = bulk;
+    c.rr_wall_layer = layer;
     c.nx = 48; c.ny = 24; c.nz = 20;
     c.u_inf = 0.06f; c.nu = 0.02f; c.cs_smag = cs; c.collision = coll; c.precision = prec;
     c.ground = ground; c.sponge_frac = 0.2f; c.ramp_steps = ramp;
@@ -418,11 +479,11 @@ static float ref_sphere_sdf(const void* ctx, Vec3 p) {
     return std::sqrt((p.x - e->x) * (p.x - e->x) + (p.y - e->y) * (p.y - e->y) + (p.z - e->z) * (p.z - e->z)) - e->r;
 }
 static void test_reference_bouzidi() {
-    for (Collision coll : {Collision::BGK, Collision::Regularized}) {
+    for (Collision coll : {Collision::BGK, Collision::Regularized, Collision::Recursive}) {
         Config c;
         c.nx = 48; c.ny = 24; c.nz = 20;
         c.u_inf = 0.06f; c.nu = 0.02f; c.cs_smag = coll == Collision::BGK ? 0.0f : 0.16f; c.collision = coll; c.precision = Precision::FP32;
-        c.ground = GroundMode::Static; c.sponge_frac = 0.2f; c.ramp_steps = 30;
+        c.ground = GroundMode::Static; c.sponge_frac = 0.2f; c.ramp_steps = 30; c.rr_wall_layer = 3;
         c.bounce = BounceBack::Interpolated; c.wall_model = WallModel::Slip; c.force_gauge = true; c.force_galilean = true;
         static const RefSphere sp{17.3f, 11.6f, 8.45f, 4.7f};
         const WallSdf wsdf{&ref_sphere_sdf, &sp};
@@ -455,7 +516,8 @@ static void test_reference_bouzidi() {
             if (!(e <= fworst)) fworst = e;
         }
         const bool ok = worst.drho < 1e-5 && worst.du < 1e-5 && fworst < 1e-3 && !s.diverged();
-        report(coll == Collision::BGK ? "2j EP Bouzidi (esfera) vs A-B BGK" : "2j EP Bouzidi (esfera) vs A-B Reg", ok,
+        report(coll == Collision::BGK ? "2j EP Bouzidi (esfera) vs A-B BGK"
+                                      : (coll == Collision::Regularized ? "2j EP Bouzidi (esfera) vs A-B Reg" : "2j EP Bouzidi (esfera) vs A-B RR"), ok,
                "200 pasos: max|dρ| %.2e  max|du| %.2e  max err rel F %.2e", worst.drho, worst.du, fworst);
     }
 }
@@ -504,6 +566,18 @@ static void test_reference() {
                        false, true);
     run_reference_case("2i EP interpolado Reg+Smag suelo fijo", Collision::Regularized, 0.16f, GroundMode::Static, Precision::FP32, 1e-5, 50,
                        false, true);
+    // (ruido del campo lejano) Regularización RECURSIVA de 3er orden + viscosidad de volumen (defecto de la app) y la
+    // proyección de 2º orden SIN viscosidad de volumen propia (esquema anterior), contra la referencia genérica
+    // (polinomios de Hermite de 3er orden escritos de forma independiente de la versión por direcciones del solver).
+    run_reference_case("2k EP vs A-B RR+Smag suelo movil, capa 3", Collision::Recursive, 0.16f, GroundMode::Moving, Precision::FP32, 1e-5, 0,
+                       false, false, 1.0f, 3);
+    run_reference_case("2l EP interpolado RR+Smag suelo fijo", Collision::Recursive, 0.16f, GroundMode::Static, Precision::FP32, 1e-5, 50,
+                       false, true);
+    run_reference_case("2m EP vs A-B RR sin suelo, sin capa", Collision::Recursive, 0.0f, GroundMode::None, Precision::FP32, 1e-5, 0,
+                       false, false, 1.0f, 0);
+    run_reference_case("2n EP vs A-B Reg sin viscosidad de volumen", Collision::Regularized, 0.16f, GroundMode::Moving, Precision::FP32,
+                       1e-5, 0, false, false, 0.0f);
+    run_reference_case("2o EP FP16S RR+Smag vs A-B (info)", Collision::Recursive, 0.16f, GroundMode::Moving, Precision::FP16S, 2e-3, 50);
     test_reference_bouzidi();
     test_reference_negative();
 }
@@ -876,7 +950,8 @@ static void test_tuning_variants() {
     { Solver::Tuning t; t.row_grain = 7; t.pair_blocks = 1; t.nt_macro = 1; vars.push_back({"grano7+pares+NT", t}); }
     struct Cfg { Precision p; Collision c; float cs; };
     const Cfg cfgs[] = {{Precision::FP32, Collision::Regularized, 0.16f}, {Precision::FP16S, Collision::BGK, 0.0f},
-                        {Precision::FP16S, Collision::Regularized, 0.16f}};
+                        {Precision::FP16S, Collision::Regularized, 0.16f}, {Precision::FP16S, Collision::Recursive, 0.10f},
+                        {Precision::FP32, Collision::Recursive, 0.0f}};
     bool ok = true;
     char why[256] = "";
     int nruns = 0;
@@ -915,7 +990,7 @@ static void test_tuning_variants() {
                               std::memcmp(&fo.force, &fref.force, sizeof fo.force) == 0;
             if (!same && ok) {
                 std::snprintf(why, sizeof why, "variante '%s' difiere (%s %s)", va.name, cf.p == Precision::FP32 ? "FP32" : "FP16S",
-                              cf.c == Collision::BGK ? "BGK" : "Reg");
+                              cf.c == Collision::BGK ? "BGK" : (cf.c == Collision::Regularized ? "Reg" : "RR"));
                 ok = false;
             }
         }

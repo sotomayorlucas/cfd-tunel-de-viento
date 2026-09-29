@@ -81,7 +81,11 @@ usa la GPU (con flush/invalidate porque el tipo cacheado no es coherente en MTL)
 
 1. **Celdas** (el 90 % del tiempo): Esoteric-Pull in-place, idéntico a `rows_kernel`:
    momentos en pares, entrada/campo lejano/salida de equilibrio (la salida copia u de x−1),
-   Regularizada o BGK + Smagorinsky con τ0(x) de la esponja, ley de pared/amortiguamiento
+   regularizada RECURSIVA (defecto; `Spec::rr`), proyección de 2.º orden o BGK, viscosidad de volumen
+   propia (`Spec::bulk`, 1 − ω_b en la cabecera de parámetros `kPOmcb`; ver docs/FISICA.md §1.5); en la capa
+   junto a los cuerpos (bit interno 7 de los flags, `kLayer` del solver, calculado por la CPU) la RR no añade su
+   término de 3er orden
+   + Smagorinsky con τ0(x) de la esponja, ley de pared/amortiguamiento
    (`kNearWall`), macro ρ,u en el último paso del lote, detección de divergencia (un atómico
    por subgrupo como mucho). **Dos celdas contiguas en x por hilo** con palabras f16×2 (ver
    `docs/opt/gpu.md`). Rebote implícito: las celdas sólidas no escriben.
@@ -128,13 +132,15 @@ Dos `lbm::Solver` idénticos, uno en la CPU y otro en la GPU, dominio 96×48×32
 
 | Caso | |Δu|/u∞ | |Δρ| | |ΔF|/|F|máx |
 |---|---|---|---|
-| [1] FP32 Regularizada, sin suelo, rebote implícito | 3.4e-6 | 1.2e-7 | 1e-6 |
+| [1] FP32 Regularizada de 2.º orden sin viscosidad de volumen (esquema anterior), sin suelo, rebote implícito | 3.4e-6 | 1.2e-7 | 2e-6 |
+| [1b] ídem con viscosidad de volumen (ω_b = 1) | 4.0e-6 | 1.2e-7 | 2.3e-6 |
 | [2] FP32 BGK | 7.1e-6 | 3.0e-7 | 6e-6 |
-| [3] FP32 escena completa: cinta, Bouzidi + Slip, ruedas girando impermeables con huella, 2 cuerpos que se tocan (76 nodos multi-id), rampa | 9.9e-7 | 1.2e-7 | 1e-7 |
-| [4] FP16S escena completa | 1.2e-3 | 9e-5 | 2.5e-4 |
-| [5] FP32 LogLaw + implícito + ruedas con Ladd | 3.2e-6 | 2.4e-7 | 2.4e-5 |
-| [6] FP16S suelo fijo + LogLaw + Bouzidi (120 pasos) | 4.6e-3 | 1.2e-4 | 5e-4 |
-| [7] set_geometry, set_viscosity, set_smagorinsky, reset_flow con un lote en vuelo, detach → CPU | ≤ 1.7e-6 | 1.2e-7 | — |
+| (desde [3]: colisión de la app, regularizada recursiva + viscosidad de volumen) | | | |
+| [3] FP32 escena completa: cinta, Bouzidi + Slip, ruedas girando impermeables con huella, 2 cuerpos que se tocan (76 nodos multi-id), rampa | 7.5e-7 | 1.2e-7 | 1e-7 |
+| [4] FP16S escena completa | 1.0e-3 | 6.6e-5 | 2e-4 |
+| [5] FP32 LogLaw + implícito + ruedas con Ladd | 3.5e-6 | 1.2e-7 | 3e-5 |
+| [6] FP16S suelo fijo + LogLaw + Bouzidi (120 pasos) | 1.2e-3 | 6.6e-5 | 3.5e-4 |
+| [7] set_geometry, set_viscosity, set_smagorinsky, reset_flow con un lote en vuelo, detach → CPU | ≤ 1.5e-6 | 1.2e-7 | — |
 | [9] 8 lotes solapados (`cycle`) con cambio de geometría en vuelo y rampa | 5e-7 | 1.2e-7 | 6e-8 |
 
 Diferencias de FP32 = orden de las operaciones y contracción en FMA del compilador de la GPU. En
@@ -145,15 +151,18 @@ perturbación de 10⁻⁶ crece ×100 en 240 pasos junto al suelo fijo), por eso
 La conversión f32→f16 de la GPU es **bit a bit igual a F16C** (RTE, subnormales incluidos:
 test_gpu_spirv [2], 65 536 valores con empates).
 
-F1 2022 a resolución rápida, configuración de la app (FP16S, Bouzidi + Slip, cinta, ruedas),
-600 pasos: fuerzas medias del último lote Fx 5.6726 / 5.6722, Fz −2.4008 / −2.3899 (CPU/GPU),
-sin divergencia. En la app completa (`--headless --steps 1500`): SCz 1.2492 / 1.2504 m²,
-SCx 2.766 / 2.773 m².
+F1 2022 a resolución rápida, configuración de la app (FP16S, Bouzidi + Slip, cinta, ruedas; colisión
+regularizada recursiva + viscosidad de volumen), 600 pasos: fuerzas medias del último lote Fx 5.5230 / 5.5230,
+Fz −1.7613 / −1.7618 (CPU/GPU), sin divergencia (con la proyección de 2.º orden anterior: 5.6726 / 5.6722 y
+−2.4008 / −2.3899). Ruido del campo lejano (`tools/noise_probe --gpu`, F1 2026 a Rápida, 2.5 PF): las mismas
+cifras que la CPU a 2-3 cifras (σ_t(Cp) 40 celdas aguas arriba 0.0011 / 0.0010).
 
 ## Limitaciones
 
-* **Tiempo**: a Media la iGPU sola da ~740 MLUPS por paso completo frente a ~870 de la CPU sin
-  carga (ver `docs/opt/gpu.md`): no es más rápida que los 22 hilos AVX2 con el mismo ancho de
+* **Tiempo**: a Media la iGPU sola da ~650 MLUPS por paso completo con la colisión recursiva (753 con la
+  proyección de 2.º orden anterior; el kernel de celdas pasa de ~7 a ~9 ms/paso: +20 % de instrucciones y
+  algunos derrames de registros en el modo de 2 celdas por hilo, ver docs/opt/lbm.md §5) frente a ~870 de la
+  CPU sin carga (ver `docs/opt/gpu.md`): no es más rápida que los 22 hilos AVX2 con el mismo ancho de
   banda compartido. La ganancia real es **liberar la CPU** para dibujar (solapamiento).
 * Resultados con un lote de retraso en el bucle interactivo (invisible a 20–40 FPS).
 * Un cambio de geometría con la GPU activa cuesta una bajada + subida de las poblaciones

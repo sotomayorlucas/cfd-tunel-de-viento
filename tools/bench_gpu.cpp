@@ -5,7 +5,7 @@
 //                                 LBM de 19 corrientes f16 in-place) por tipo de memoria,
 //                                 tamaño de subgrupo y de grupo de trabajo
 //    bench_gpu --lbm [opciones]   MLUPS del solver LBM en la GPU frente a la CPU
-//        --cells N   --fp32   --sg 8|16|32   --wg N   --steps N   --reps N
+//        --cells N   --fp32   --sg 8|16|32   --wg N   --steps N   --reps N   --coll pr|rr|bgk   --bulk ω_b
 //    bench_gpu --cpu-read         lectura de la CPU de memoria escrita por la GPU (WC vs cacheada)
 //
 //  Tiempos de GPU con marcas de tiempo (vkCmdWriteTimestamp); medianas de varias rondas
@@ -173,6 +173,8 @@ int bench_lbm(int argc, char** argv) {
     Preset pr = Preset::Media;
     bool fp32 = false, cpu = true;
     int steps = 100, reps = 5;
+    lbm::Collision coll = lbm::Collision::Recursive;   // defecto de la app
+    float bulk = 1.0f;
     gpu::LbmGpuTuning tun;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -189,6 +191,8 @@ int bench_lbm(int argc, char** argv) {
         else if (a == "--coherent") tun.ddf_mem = vk::Mem::Coherent;
         else if (a == "--rerecord") tun.reuse_cmd = false;
         else if (a == "--single") tun.pair = false;
+        else if (a == "--coll") { const std::string c = nxt(); coll = c == "bgk" ? lbm::Collision::BGK : (c == "pr" ? lbm::Collision::Regularized : lbm::Collision::Recursive); }
+        else if (a == "--bulk") bulk = std::strtof(nxt(), nullptr);
     }
     pool().start();
     Sim sim;
@@ -196,6 +200,8 @@ int bench_lbm(int argc, char** argv) {
     if (sim.cfg.model < 0) { std::printf("modelo desconocido %s\n", model.c_str()); return 1; }
     sim.cfg.preset = pr;
     sim.cfg.fp32 = fp32;
+    sim.cfg.collision = coll;
+    sim.cfg.bulk_omega = bulk;
     sim.cfg.ground = models::info(sim.cfg.model).needs_ground ? lbm::GroundMode::Moving : lbm::GroundMode::None;
     sim.init();
     const double N = static_cast<double>(sim.dom.cells());

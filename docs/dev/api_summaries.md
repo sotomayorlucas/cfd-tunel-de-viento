@@ -37,7 +37,9 @@ Semantics other modules must know:
 - Everything is in lattice units.
 - Call from a single thread; the solver is not reentrant.
 
-Recommended on the Core Ultra 7 155H: the default pool (20 threads, no LP-E cores) without pinning; FP16S + Regularized + LES (the Config defaults).
+Recommended on the Core Ultra 7 155H: the default pool (20 threads, no LP-E cores) without pinning; FP16S + Recursive (third-order recursive regularization) + bulk viscosity (bulk_omega = 1) + LES (the Config defaults).
+
+(Noise fix) Config::collision now defaults to Collision::Recursive and Config::bulk_omega to 1. The second-order projection (Collision::Regularized) is linearly unstable at nu = 1e-4 with u_inf = 0.09: an empty tunnel fills with ±38 % noise. Setting bulk_omega = 0 restores the trace relaxation with the shear omega (the old behaviour). See docs/FISICA.md §1.5.
 
 Measured on 256x128x96: about 1000 MLUPS FP16S and 505 MLUPS FP32, around 94% of the 84 GB/s memory ceiling.
 
@@ -59,7 +61,7 @@ Nota para app/voxelizador: los ids de sólido que caigan en las 6 caras se ignor
 - Tuning::max_threads no controla qué núcleos participan (limitación de la API del pool): medido peor que un pool pequeño, no recomendado
 - Todas las mediciones de rendimiento tienen ruido alto por la carga ajena (carga media 2–27); dos configuraciones idénticas llegaron a diferir 10–18 % entre rondas. Las primeras campañas multihilo tenían un artefacto propio (primera medición tras recrear el pool penalizada 20–60 %, siempre FP16-Reg) que se detectó y corrigió; las tablas finales son del bench corregido
 - El techo 'colisión nula' (≥885 MLUPS FP16S, ≥480 FP32) se midió con el bench antes de la corrección: es una cota inferior
-- BGK con ν=2e-4 (τ≈0.5006) diverge en el caso coche aunque haya LES (lo detecta diverged()); para Re altos usar Regularizado (defecto)
+- BGK con ν=2e-4 (τ≈0.5006) diverge en el caso coche aunque haya LES (lo detecta diverged()); para Re altos usar la regularización recursiva (defecto). La proyección de 2.º orden (Regularized) tampoco es estable a ν = 1e-4, u∞ = 0.09: satura en ruido de ±38 % de u∞ (docs/FISICA.md §1.5)
 - FP16S: |f-w| debe mantenerse < 2 (rango de half con escala 2^15); flujos patológicos (Mach alto) desbordarían a Inf, lo que diverged() detecta
 - Las caras del dominio anulan ids de sólido; con suelo la capa z=0 entera es sólido 255, así que la fuerza del id 255 incluye todo el suelo
 - total_mass() es O(N) y de un solo hilo (sólo diagnóstico/tests)

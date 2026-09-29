@@ -20,7 +20,7 @@ AVX2/FMA/F16C, sin AVX-512; ~82 GB/s de memoria).
 ## Qué hace
 
 * **Solver**: Lattice Boltzmann D3Q19 con streaming *Esoteric-Pull* in-place (una sola copia de las
-  poblaciones), almacenamiento **FP16S** (o FP32), colisión regularizada + LES Smagorinsky, rebote
+  poblaciones), almacenamiento **FP16S** (o FP32), colisión regularizada recursiva (3er orden) con viscosidad de volumen + LES Smagorinsky, rebote
   en sólidos con paredes móviles (ruedas, cinta), entrada/salida/campo lejano, esponja de salida y
   fuerzas por pieza (intercambio de momento). ~800 MLUPS en FP16S en este portátil con un F1 a
   resolución media (núcleo ~950 MLUPS + la pasada de fuerzas/pared del rebote interpolado).

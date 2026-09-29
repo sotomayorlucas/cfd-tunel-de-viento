@@ -4,8 +4,10 @@
 //  Dos lbm::Solver idénticos: uno avanza en la CPU, el otro enganchado a
 //  gpu::LbmGpu. Tras cientos de pasos se comparan ρ, u (todas las celdas) y las
 //  fuerzas/momentos por id (último paso y media del lote).
-//   [1] FP32 Regularizada, sin suelo, rebote implícito, esfera
+//   [1] FP32 Regularizada (2º orden, sin viscosidad de volumen), sin suelo, rebote implícito
+//   [1b] ídem con viscosidad de volumen (ω_b = 1)
 //   [2] FP32 BGK (misma escena)
+//   (desde [3], colisión de la app: regularización recursiva de 3er orden + viscosidad de volumen)
 //   [3] FP32 escena completa: cinta móvil, rebote interpolado (Bouzidi) con SDF, modelo
 //       Slip, ruedas girando impermeables con huella, dos cuerpos que se tocan (nodos
 //       multi-id), rampa de arranque
@@ -141,7 +143,7 @@ void run_case(gpu::LbmGpu& G, Case c) {
     if (const char* e = std::getenv("CFD_T_STEPS")) c.steps = std::atoi(e);
     if (std::getenv("CFD_T_FP32")) { c.cfg.precision = Precision::FP32; c.tol_u = 1e-5; c.tol_rho = 1e-5; c.tol_f = 1e-4; }
     std::printf("[%s] %dx%dx%d, %s %s, %d pasos\n", c.name, c.cfg.nx, c.cfg.ny, c.cfg.nz, c.cfg.precision == Precision::FP32 ? "FP32" : "FP16S",
-                c.cfg.collision == Collision::BGK ? "BGK" : "Reg", c.steps);
+                c.cfg.collision == Collision::BGK ? "BGK" : (c.cfg.collision == Collision::Regularized ? "Reg" : "RR"), c.steps);
     const auto g = voxelize(c.scene, c.cfg.nx, c.cfg.ny, c.cfg.nz);
     Solver cpu, gs;
     setup(cpu, c, g);
@@ -196,7 +198,9 @@ Config base_cfg(Precision p) {
     c.nu = 2e-3f;
     c.cs_smag = 0.10f;
     c.precision = p;
-    c.collision = Collision::Regularized;
+    c.collision = Collision::Recursive;   // defecto de la app (regularización recursiva + viscosidad de volumen)
+    c.bulk_omega = 1.0f;
+    c.rr_wall_layer = 3;                  // capa fina: en este dominio pequeño quedan celdas con y sin término de 3er orden
     c.ground = GroundMode::Moving;
     c.wall_model = WallModel::Slip;
     c.wall_nu = 1e-5f;
@@ -328,8 +332,16 @@ int main(int argc, char** argv) {
     const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
     pool().start();
 
-    {   // [1] básico
+    {   // [1] básico: proyección de 2º orden SIN viscosidad de volumen propia (esquema anterior)
         Case c{"1", base_cfg(Precision::FP32), Scene{}};
+        c.cfg.collision = Collision::Regularized; c.cfg.bulk_omega = 0.0f;
+        c.cfg.ground = GroundMode::None; c.cfg.bounce = BounceBack::Implicit; c.cfg.wall_model = WallModel::None;
+        c.scene.wheels = false; c.scene.second = false; c.scene.bz0 = 10; c.scene.bz1 = 20; c.sdf = false;
+        run_case(G, c);
+    }
+    {   // [1b] proyección de 2º orden + viscosidad de volumen (ω_b = 1)
+        Case c{"1b", base_cfg(Precision::FP32), Scene{}};
+        c.cfg.collision = Collision::Regularized;
         c.cfg.ground = GroundMode::None; c.cfg.bounce = BounceBack::Implicit; c.cfg.wall_model = WallModel::None;
         c.scene.wheels = false; c.scene.second = false; c.scene.bz0 = 10; c.scene.bz1 = 20; c.sdf = false;
         run_case(G, c);

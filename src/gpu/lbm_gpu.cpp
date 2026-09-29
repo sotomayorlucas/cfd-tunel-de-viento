@@ -94,7 +94,7 @@ struct LbmGpu::Impl {
 
     static bool same(const Spec& a, const Spec& b) {
         if (a.nx != b.nx || a.ny != b.ny || a.nz != b.nz || a.N != b.N || a.S != b.S || a.P != b.P) return false;
-        if (a.fp16 != b.fp16 || a.regularized != b.regularized || a.wall != b.wall || a.interp != b.interp || a.slip != b.slip) return false;
+        if (a.fp16 != b.fp16 || a.regularized != b.regularized || a.rr != b.rr || a.bulk != b.bulk || a.wall != b.wall || a.interp != b.interp || a.slip != b.slip) return false;
         if (a.gauge != b.gauge || a.galilean != b.galilean || a.wg != b.wg || a.sg != b.sg || a.wg_nodes != b.wg_nodes || a.gx != b.gx) return false;
         if (a.pair != b.pair || a.ground != b.ground || a.classify != b.classify) return false;
         return a.rte16 == b.rte16 && a.denorm16 == b.denorm16;
@@ -179,6 +179,8 @@ bool LbmGpu::Impl::upload() {
     for (int k = 0; k < 19; ++k) sp.off[k] = v.off[k];
     sp.fp16 = c.precision == lbm::Precision::FP16S;
     sp.regularized = c.collision == lbm::Collision::Regularized;
+    sp.rr = c.collision == lbm::Collision::Recursive;
+    sp.bulk = c.collision != lbm::Collision::BGK && c.bulk_omega > 0.0f;
     sp.wall = c.wall_model != lbm::WallModel::None;
     sp.interp = c.bounce == lbm::BounceBack::Interpolated;
     sp.slip = sp.interp && c.wall_model == lbm::WallModel::Slip;
@@ -425,6 +427,7 @@ void LbmGpu::Impl::write_params(int n, u64 t0, int half, int region) {
     P[kPK] = 18.0f * std::sqrt(2.0f) * c.cs_smag * c.cs_smag;
     P[kPWallC3] = v.wall_c3;
     P[kPWallFloor] = v.wall_floor;
+    P[kPOmcb] = 1.0f - std::clamp(c.bulk_omega, 0.0f, 1.99f);   // = Solver::Impl::run_kernel
     P[kPMacroBase] = std::bit_cast<float>(static_cast<u32>(static_cast<u64>(half) * 4 * N));
     const float nu_w = std::max(c.wall_nu > 0.0f ? c.wall_nu : c.nu, 1e-9f);
     P[kPNuW] = nu_w;

@@ -6,7 +6,8 @@
 //     de las poblaciones, mitad de memoria y de tráfico que A-B.
 //   * Almacenamiento FP16S (poblaciones desplazadas f_i - w_i, escaladas, en
 //     IEEE half con F16C) o FP32; aritmética siempre en FP32.
-//   * Colisión BGK o Regularizada + Smagorinsky (LES) para Re altos.
+//   * Colisión BGK, Regularizada (2º orden) o Regularizada RECURSIVA (3er orden, defecto) + viscosidad de
+//     volumen propia (bulk_omega) + Smagorinsky (LES) para Re altos (ver docs/FISICA.md §1.5).
 //   * Kernel AVX2 sobre filas en X (8 celdas por registro). Entrada, salida,
 //     campo lejano, sólidos y la cinta móvil van por la ruta vectorial (con
 //     máscaras); la ruta escalar sólo atiende a vecinos de paredes móviles
@@ -48,7 +49,13 @@ enum class GroundMode : u8 {
     Static,    // suelo fijo sin deslizamiento (túnel antiguo: crece capa límite)
     Moving,    // cinta móvil a u∞ (rolling road): el suelo real visto desde el coche
 };
-enum class Collision : u8 { BGK, Regularized };   // ambos admiten Smagorinsky (cs_smag > 0)
+// Colisión (todas admiten Smagorinsky, cs_smag > 0):
+//  BGK          → relajación simple (inestable a τ → ½).
+//  Regularized  → proyección de Hermite de 2º orden del no equilibrio (PR).
+//  Recursive    → regularización RECURSIVA de 3er orden (RR, Malaspinas 2015 / Coreixas 2017) con las 6 combinaciones
+//                 de 3er orden que soporta D3Q19, en el equilibrio y en el no equilibrio. Defecto de la app: con PR a
+//                 ν = 1e-4 y u∞ = 0.09 un túnel VACÍO se llenaba de ruido (±40 % de u∞, ver docs/FISICA.md §1.5).
+enum class Collision : u8 { BGK, Regularized, Recursive };
 enum class Precision : u8 { FP32, FP16S };
 // Modelo de pared en las paredes FIJAS (ver docs/FISICA.md). Con dx de centímetros la capa límite real
 // (≈ 1 % de la cuerda) es mucho más fina que una celda: un rebote "no deslizante" por enlace la convierte
@@ -94,7 +101,7 @@ struct Config {
     float u_inf = 0.08f;               // velocidad de entrada (red)
     float nu = 2e-4f;                  // viscosidad cinemática (red): τ = 3ν + ½
     float cs_smag = 0.16f;             // constante de Smagorinsky (0 = sin LES)
-    Collision collision = Collision::Regularized;
+    Collision collision = Collision::Recursive;
     Precision precision = Precision::FP16S;
     GroundMode ground = GroundMode::Moving;
     float sponge_frac = 0.12f;         // fracción final del dominio (en X) con viscosidad creciente
@@ -110,6 +117,19 @@ struct Config {
     bool force_galilean = true;        // intercambio de momento galileanamente invariante en paredes móviles
                                        // (Wen et al., J. Comput. Phys. 266, 2014): resta u_w·(f_out - f_in).
     BounceBack bounce = BounceBack::Interpolated;
+    // Viscosidad de VOLUMEN (colisiones regularizadas): la traza de Π^neq se relaja con su propio ω_b ∈ (0, 2)
+    // (0 = con la ω de la cortante, como antes). Con ω_b = 1 (defecto) ν_b = (2/9)(1/ω_b − ½) = 1/9 en red:
+    // amortigua las ondas acústicas y el modo par/impar de periodo 2 que con ν = 1e-4 (τ = 0.5003) apenas se
+    // amortiguaban (pulso del arranque, rebotes en las caras). Sólo actúa sobre ∇·u (≈ 0 en flujo incompresible).
+    // BGK la ignora. Ver docs/FISICA.md §1.5.
+    float bulk_omega = 1.0f;
+    // (Sólo con Collision::Recursive) CAPA junto a los cuerpos, en celdas (distancia de Chebyshev a un sólido que no es el
+    // suelo, extendida a bloques completos de 8 en x), donde la colisión NO añade el término de 3er orden (queda la
+    // proyección de 2º orden, con la que se calibró la física de pared). Con RR también en la capa límite los perfiles se
+    // desprendían (NACA 0012 a 6°, Media: CL 0.30 → 0.13, desprendimiento desde el borde de ataque; Ahmed: CL −0.29 →
+    // +0.82). Medido (docs/FISICA.md §1.5): 6-8 celdas recuperan las fuerzas y el campo lejano sigue limpio; con 12 el
+    // ruido empieza a reaparecer junto al coche y con 24 vuelve. 0 = RR en todo el dominio.
+    int rr_wall_layer = 8;
 };
 
 // Movimiento de pared en unidades de red (igual que LatticeMap::LatticeMotion).

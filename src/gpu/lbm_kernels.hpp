@@ -61,6 +61,7 @@ enum Param : u32 {
     kPMacroBase = 3,    // (u32) desplazamiento de la mitad de campos macro que escribe este lote
     kPNuW = 4, kPInvNuW = 5, kPWwA0 = 6,   // ley de pared del modelo Slip
     kPNu = 7, kPXs = 8, kPNuMax = 9, kPSponge = 10,   // τ0(x) analítico (= Solver::Impl::build_tau)
+    kPOmcb = 11,        // 1 − ω_b de la traza de Π^neq (viscosidad de volumen; sólo con Spec::bulk)
 };
 // Por paso (base kParamHeader + i·kParamPerStep)
 enum StepParam : u32 { kSUin = 0, kSR = 1, kSUg = 2, kSR1 = 3, kSUg1 = 4, kSFout = 5 /* u32 */ };
@@ -77,7 +78,9 @@ struct Spec {
     i64 off[19] = {};
     // Física / almacenamiento
     bool fp16 = true;
-    bool regularized = true;
+    bool regularized = true;     // proyección de 2º orden (PR)
+    bool rr = false;             // regularización recursiva de 3er orden (lbm::Collision::Recursive)
+    bool bulk = false;           // traza de Π^neq con relajación propia (lbm::Config::bulk_omega > 0)
     bool wall = true;            // kNearWall presente (modelo de pared ≠ None)
     bool interp = true;          // rebote interpolado (Bouzidi): pasada de contorno escribe
     bool slip = true;            // modelo Slip (requiere interp)

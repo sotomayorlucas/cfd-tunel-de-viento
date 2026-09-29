@@ -197,3 +197,44 @@ g++ -std=c++23 -O1 -g -march=native -fsanitize=thread -Isrc -pthread \
 * Bit interno `kGroundOnly = 1<<5` visible en `FieldView::flags`: los consumidores deben usar máscaras (hoy todos lo hacen). Pendiente reservarlo en `lbm/field.hpp` (archivo compartido, no editado).
 * Rebote implícito full-way: transitorios con 1 paso de retardo frente a half-way (estacionario idéntico). Es lo que pide la especificación (sólidos sin procesar).
 * La fuerza del id 255 (suelo) incluye la presión sobre TODO el plano z=0 (~−N_xy/3 en z): no usarla como carga aerodinámica.
+
+---
+
+## 5. Ruido del campo lejano: regularización recursiva + viscosidad de volumen + capa de 2.º orden
+
+Diagnóstico, física y cifras de ruido/calibración: [`docs/FISICA.md` §1.5](../FISICA.md). Herramienta:
+`build/tools/noise_probe` (`tools/noise_probe.cpp`: regiones de campo lejano y capa junto a los cuerpos, σ espacial y
+temporal, paso alto, modo de Nyquist, par/impar, espectro, sonda; `--calib` para fuerzas medias; `--gpu`). Resumen:
+la proyección de 2.º orden era **linealmente inestable** a ν = 1·10⁻⁴, u∞ = 0.09 (un túnel vacío se llenaba de ruido
+de ±38 % de u∞); se corrige con la regularización recursiva (RR) del no equilibrio de 3er orden, se añade viscosidad
+de volumen para el sonido y se mantiene la proyección de 2.º orden en una capa de 8 celdas junto a los cuerpos (la RR
+en la capa límite cambiaba la física de pared calibrada).
+
+### Implementación (CPU; la iGPU igual, docs/GPU.md)
+
+| # | Qué | Dónde | Nota / medida |
+|---|---|---|---|
+| 22 | **Traza de Π^neq separada** y relajada con ω_b (`Config::bulk_omega`, defecto 1): 4.5·Q:Π = parte desviadora + trm·(\|c\|² − 1); la traza va en el término constante de cada clase de peso → 1 FMA por celda | `solver.cpp` `collide` | Plantilla `Bulk` (omcb constante del paso): con una mezcla en tiempo de ejecución omcb/omc la traza dependía de ω y llvm-mca daba +15 % de ciclos por bloque (FP16-Reg 129 → 152); con la plantilla, 129 (= antes) |
+| 23 | **RR** (`Collision::Recursive`): a3neq = u_α Π_βγ + … en las 6 combinaciones de 3er orden de D3Q19 (±9w por dirección, forma cerrada por clases de dirección; comprobada contra la proyección genérica con polinomios de Hermite de la referencia A-B) | `collide` | Forma "par ± impar": E = fma(1−ω, pr, t), O = fma(1−ω, p3, ra), st = E ± O. llvm-mca (ciclos por bloque de 8, FP16S / FP32): 2.º orden 129 / 107, RR 131 / 123. Variantes medidas y descartadas: término sumado a ra (148 / 121), a3neq recalculado por par desde m_αβ (135-137 / 123-132), equilibrio de 3er orden (+15 op./celda y no estabiliza) |
+| 24 | **Capa de 2.º orden** (`Config::rr_wall_layer` = 8): dilatación de Chebyshev de los sólidos (3 pasadas separables sobre bytes en `rebuild`), extendida a bloques de 8 en x → bit interno `kLayer` (1<<7) + bit de clase `kBlkLayer`; el bloque pasa (1−ω)·máscara al término de 3er orden (1 AND) | `rebuild` 3b, `rows_kernel` | Sin plantillas nuevas: en la capa se hace la misma aritmética con el término multiplicado por 0 (misma operación que la iGPU, que lee el bit por celda) |
+
+Tests nuevos (`tests/test_lbm.cpp`, referencia A-B ampliada con la RR genérica, la viscosidad de volumen y la capa):
+2k RR+Smag suelo móvil con capa 3, 2l RR interpolado suelo fijo, 2m RR sin capa, 2n 2.º orden sin viscosidad de
+volumen (esquema anterior), 2o FP16S RR (info), 2j esfera Bouzidi RR; todos a ~1e-7 (FP32). Test 12 (variantes de
+`Tuning` bit a bit) con RR en FP16S y FP32. `tests/test_gpu.cpp`: [1] 2.º orden sin ν_b, [1b] con ν_b, [3]-[9] RR con
+capa 3 (paridad a 1e-6 en FP32).
+
+### Coste medido (la máquina tenía carga de fondo 10-18 durante estas medidas: medianas, A/B intercalado)
+
+| Medida | 2.º orden (antes) | RR + ν_b + capa (ahora) | Δ |
+|---|---|---|---|
+| llvm-mca, ciclos por bloque de 8, FP16S / FP32 | 129 / 107 | 131 / 123 | +2 % / +15 % |
+| Por núcleo P (tiempo de CPU, 256×128×96, `bench_lbm single`), FP16S / FP32 | 172 / 161 MLUPS | 149 / 124 MLUPS | −13 % / −23 % |
+| Chip completo, mismo proceso (`bench_lbm lbm`, coche), 256×128×96 FP16S | 894 MLUPS (kernel 1016) | 833 (939) | −7 % |
+| ídem 384×160×128 FP16S | 626 (706) | 551 (613) | −12 % (con carga) |
+| `cfd --bench --res media` (F1 2022, 6.1 M), kernel ms/paso, mediana de 4 rondas intercaladas | 8.3 ms | 9.7 ms | −15 % (carga 10-18: la CPU deja de estar limitada por memoria) |
+| iGPU `cfd --bench --res media --gpu`, paso completo | 753 MLUPS | 651 MLUPS | −13.5 % |
+| iGPU, kernel de celdas (`bench_gpu --lbm`) | ~7 ms | ~9 ms | +20 % de instrucciones, derrames 0:0 → ~16:40 en el modo de 2 celdas por hilo |
+
+Justificación: sin la corrección el campo que se dibuja y del que salen las fuerzas es ruido (±38 % de u∞ en el túnel
+vacío). La viscosidad de volumen y la capa son gratis; el coste es el término de 3er orden.

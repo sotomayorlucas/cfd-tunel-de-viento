@@ -497,10 +497,12 @@ void Sim::init() {
     c.u_inf = cfg.u_lat;
     c.nu = nu;
     c.cs_smag = cfg.cs;
-    c.collision = lbm::Collision::Regularized;
+    c.collision = cfg.collision;
     c.precision = cfg.fp32 ? lbm::Precision::FP32 : lbm::Precision::FP16S;
     c.ground = cfg.ground;
     c.sponge_frac = 0.12f;
+    c.bulk_omega = cfg.bulk_omega;
+    c.rr_wall_layer = cfg.rr_wall_layer;
     // Arranque impulsivo por defecto (ver SimConfig::ramp_ft). Estable con la ley de pared y el rebote
     // interpolado (verificado en los 18 modelos, ver docs/FISICA.md): ya no hace falta el programa de
     // viscosidad del arranque de la primera integración.

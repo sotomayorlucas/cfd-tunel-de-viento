@@ -61,6 +61,7 @@ enum BlockClass : u8 {
     kBlkScalar = 3,   // pared móvil cerca (kNearMoving / kMoving) que no es sólo la cinta: ruta escalar
     kBlkGround = 4,   // capa z=1 sobre la cinta móvil: AVX2 con máscaras + corrección de Ladd constante
     kBlkWall = 8,     // BIT añadido a Pure/Masked/Ground: algún carril junto a pared con ley de pared
+    kBlkLayer = 16,   // BIT: bloque en la capa junto a los cuerpos (kLayer en sus 8 carriles): sin término de 3er orden
 };
 // Bit interno de flags (no forma parte de field.hpp): celda kNearMoving cuyo ÚNICO vecino móvil
 // es el suelo (cinta a u_g x̂). La corrección de pared móvil sobre ella es la misma en todas:
@@ -70,6 +71,11 @@ constexpr u8 kGroundOnly = 1u << 5;
 // → primera celda junto a la pared: ley de pared (WallModel::LogLaw). Los consumidores de FieldView
 // usan máscaras (flags & kSolid), así que un bit interno más no les afecta.
 constexpr u8 kNearWall = 1u << 6;
+// Bit interno de flags: celda en la CAPA junto a los cuerpos (Config::rr_wall_layer celdas de un sólido que no es el
+// suelo, extendida a bloques completos de 8 en x) donde la colisión recursiva NO añade su término de 3er orden (= la
+// proyección de 2º orden). Ver collide y docs/FISICA.md §1.5: con RR también en la capa límite los perfiles se
+// desprendían (NACA 0012 a 6°, Media: CL 0.30 → 0.13) y cambiaba toda la calibración.
+constexpr u8 kLayer = 1u << 7;
 // Distancia de la primera celda a la pared (rebote a mitad de enlace) en la ley de pared (modelo LogLaw).
 constexpr float kWallY = 0.5f;
 // Suelo de estabilidad de la ley de pared: τ ≥ ½ + kWallFloor·(τ_LES − ½) (ver wall_omc). Medido en el F1 2022
@@ -224,8 +230,8 @@ inline float wall_c3(float nu_w) {
 // Sc = escala de almacenamiento (1 en FP32, 2^15 en FP16S): se pliega en los pesos → 0 mul extra.
 // ORDEN: en cada par se leen f_i y f_{i+1} ANTES de escribir, porque st(i) pisa la posición de
 // la que se leyó f_{i+1} (y viceversa).
-template <Collision C, float Sc, class V, class Ld, class St>
-CFD_INLINE void collide(const Ld& ld, const St& st, V drho, V rho, V ux, V uy, V uz, const Neq<V>& q, V omc) {
+template <Collision C, float Sc, bool Bulk, class V, class Ld, class St>
+CFD_INLINE void collide(const Ld& ld, const St& st, V drho, V rho, V ux, V uy, V uz, const Neq<V>& q, V omc, V omcb, V om3) {
     const V ux3 = V(3.0f) * ux, uy3 = V(3.0f) * uy, uz3 = V(3.0f) * uz;
     const V c3 = V(0.0f) - vfma(ux3, ux, vfma(uy3, uy, uz3 * uz));   // -3u²
     const V hr = V(0.5f) * rho;
@@ -234,33 +240,83 @@ CFD_INLINE void collide(const Ld& ld, const St& st, V drho, V rho, V ux, V uy, V
     constexpr float W0 = L::w[0] * Sc, W1 = L::w[1] * Sc, W2 = L::w[7] * Sc;
     const V r1 = V(W1) * rho, h1 = V(W1) * hr, d1 = V(W1) * drho;
     const V r2 = V(W2) * rho, h2 = V(W2) * hr, d2 = V(W2) * drho;
-    if constexpr (C == Collision::Regularized) {
+    if constexpr (C != Collision::BGK) {
         // post = f̃eq + (1-ω)·[W·4.5·(c c - δ/3):Π^neq]. La proyección NO depende de ω → se calcula en
         // paralelo con la cadena larga de Smagorinsky (2 sqrt + div) y (1-ω) entra con UNA FMA final
         // por dirección: la ruta crítica tras ω pasa de ~6 operaciones a 1.
         const V mxx = V(4.5f) * q.xx, myy = V(4.5f) * q.yy, mzz = V(4.5f) * q.zz;
         const V mxy = V(9.0f) * q.xy, mxz = V(9.0f) * q.xz, myz = V(9.0f) * q.yz;
+        // Traza (parte de VOLUMEN) separada de la desviadora: 4.5·Q_i:Π = 4.5·Q_i:Π_dev + trm·(|c_i|² − 1) con
+        // trm = 1.5·tr Π. Ejes (|c|² = 1): sólo desviadora; diagonales (|c|² = 2): + trm; reposo: − trm. La traza se
+        // relaja con (1 − ω_b) (omcb; = omc sin viscosidad de volumen propia) y se pliega en el término constante de
+        // cada clase de peso → 1 FMA por celda en vez de 1 por dirección.
         const V trm = (mxx + myy + mzz) * V(1.0f / 3.0f);
         const V rx = mxx - trm, ry = myy - trm, rz = mzz - trm;
-        auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW) {
-            const V t = vfma(hW, vfma(a, a, c3), dW);
-            const V ra = rW * a;
-            const V pr = V(W) * R;
-            st(i, vfma(omc, pr, t + ra));
-            st(i + 1, vfma(omc, pr, t - ra));
-        };
-        st(0, vfma(omc, V(-W0) * trm, V(W0) * vfma(hr, c3, drho)));
-        pair(1, ux3, rx, W1, r1, h1, d1);
-        pair(3, uy3, ry, W1, r1, h1, d1);
-        pair(5, uz3, rz, W1, r1, h1, d1);
-        const V rxy = rx + myy, rxz = rx + mzz, ryz = ry + mzz;
-        pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2);
-        pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2);
-        pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2);
-        pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2);
-        pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2);
-        pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2);
+        // Con Bulk (plantilla) omcb es una constante del paso: la traza NO depende de la cadena de Smagorinsky y no
+        // alarga la ruta crítica (llvm-mca: con una mezcla en tiempo de ejecución, +15 % de ciclos por bloque).
+        const V tb = (Bulk ? omcb : omc) * trm;
+        const V d2b = vfma(V(W2), tb, d2);
+        st(0, vfnma(V(W0), tb, V(W0) * vfma(hr, c3, drho)));
+        const V rxy = rx + ry, rxz = rx + rz, ryz = ry + rz;
+        if constexpr (C == Collision::Regularized) {
+            auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW) {
+                const V t = vfma(hW, vfma(a, a, c3), dW);
+                const V ra = rW * a;
+                const V pr = V(W) * R;
+                st(i, vfma(omc, pr, t + ra));
+                st(i + 1, vfma(omc, pr, t - ra));
+            };
+            pair(1, ux3, rx, W1, r1, h1, d1);
+            pair(3, uy3, ry, W1, r1, h1, d1);
+            pair(5, uz3, rz, W1, r1, h1, d1);
+            pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2b);
+            pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2b);
+            pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2b);
+            pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2b);
+            pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2b);
+            pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2b);
+        } else {
+            // REGULARIZACIÓN RECURSIVA (Malaspinas 2015; Coreixas et al., PRE 96, 033306, 2017): el no equilibrio de
+            // 3er orden se reconstruye de Π^neq, a3neq_αβγ = u_α Π_βγ + u_β Π_αγ + u_γ Π_αβ, proyectado sobre las 6
+            // combinaciones de polinomios de Hermite de 3er orden que D3Q19 soporta (normas de la red 2/27 la suma y
+            // 6/27 la diferencia → coeficientes 1/(2c_s⁶) y 1/(6c_s⁶)). Por dirección queda un término IMPAR en c:
+            //   ejes ±x: ∓9w(a_xyy + a_xzz) (y cíclicos);  diagonales (c_x, c_y, 0): 9w(c_y a_xxy + c_x a_xyy) (y cíclicos).
+            // Se relaja con la ω de la cortante. Con la proyección de 2º orden esos momentos quedan libres (se ponen a 0
+            // cada paso) y a ν → 0 con Ma ≈ 0.16 el esquema es LINEALMENTE INESTABLE: un túnel VACÍO se llenaba de ruido
+            // de ±40 % de u∞ (docs/FISICA.md §1.5). El equilibrio sigue siendo de 2º orden: su término de 3er orden
+            // (ρuuu) se probó y no aporta estabilidad (medido), y cuesta ~15 operaciones más por celda.
+            // Forma "par ± impar": E = f̃eq_par + (1−ω)·Π-término, O = f̃eq_impar + (1−ω)·a3neq-término; st = E ± O.
+            // llvm-mca (Golden Cove, ciclos por bloque de 8, FP16S / FP32): proyección de 2º orden 129 / 107; esta forma
+            // 131 / 123; con el término sumado a ra (forma de la proyección) 148 / 121; recalculando a3neq de m_αβ por
+            // par (menos valores vivos, pensado para la iGPU) 135-137 / 123-132 → se queda esta (también en la iGPU,
+            // donde las tres dan el mismo tiempo: docs/opt/gpu.md).
+            const V ux2 = ux + ux, uy2 = uy + uy, uz2 = uz + uz;
+            const V k9 = V(9.0f * W2);   // 9·w_diag (con la escala de almacenamiento); ejes: 9·w_eje = 2·(9·w_diag)
+            const V nxxy = k9 * vfma(ux2, q.xy, uy * q.xx), nxyy = k9 * vfma(uy2, q.xy, ux * q.yy);
+            const V nxzz = k9 * vfma(uz2, q.xz, ux * q.zz), nxxz = k9 * vfma(ux2, q.xz, uz * q.xx);
+            const V nyzz = k9 * vfma(uz2, q.yz, uy * q.zz), nyyz = k9 * vfma(uy2, q.yz, uz * q.yy);
+            auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW, V p3) {
+                const V t = vfma(hW, vfma(a, a, c3), dW);
+                const V ra = rW * a;
+                const V pr = V(W) * R;
+                const V E = vfma(omc, pr, t);
+                const V O = vfma(om3, p3, ra);
+                st(i, E + O);
+                st(i + 1, E - O);
+            };
+            const V m2 = V(-2.0f);
+            pair(1, ux3, rx, W1, r1, h1, d1, m2 * (nxyy + nxzz));
+            pair(3, uy3, ry, W1, r1, h1, d1, m2 * (nxxy + nyzz));
+            pair(5, uz3, rz, W1, r1, h1, d1, m2 * (nyyz + nxxz));
+            pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2b, nxxy + nxyy);
+            pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2b, nxzz + nxxz);
+            pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2b, nyzz + nyyz);
+            pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2b, nxyy - nxxy);
+            pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2b, nxzz - nxxz);
+            pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2b, nyzz - nyyz);
+        }
     } else {
+        (void)omcb; (void)om3;   // BGK: la traza se relaja con ω (sin viscosidad de volumen propia)
         auto pair = [&](int i, V a, V rW, V hW, V dW) {
             const V fi = ld(i), fj = ld(i + 1);
             const V t = vfma(hW, vfma(a, a, c3), dW);
@@ -300,6 +356,8 @@ struct alignas(64) KCtx {
     float K;                  // 18√2 C_s²
     float wallC3;             // 3·C de la ley de pared (ver wall_omc)
     float wall_floor;         // fracción mínima de la viscosidad LES en celdas junto a pared
+    float omcb;               // 1 − ω_b de la traza de Π^neq (viscosidad de volumen), si bulk
+    bool bulk;                // viscosidad de volumen propia (si no, la traza se relaja con la omc de la celda)
     float u_in;               // u∞ instantánea (rampa)
     float u_ground;           // velocidad de la cinta (0 si el suelo no es móvil)
     int nx, ny, nz, nbx;
@@ -330,8 +388,8 @@ CFD_INLINE void store_macro(const KCtx& k, i64 n0, f8 r, f8 x, f8 y, f8 z) {
 // ---- Ruta AVX2: 8 celdas contiguas en x ------------------------------------------------------
 template <Precision P> inline constexpr float kSc = P == Precision::FP32 ? 1.0f : kScale;
 
-template <Precision P, Collision C, bool Macro, bool Masked, bool Ground = false, bool Wall = false>
-CFD_INLINE void block_vec(const KCtx& k, i64 n0, int x0, __m256& bad) {
+template <Precision P, Collision C, bool Macro, bool Bulk, bool Masked, bool Ground = false, bool Wall = false>
+CFD_INLINE void block_vec(const KCtx& k, i64 n0, int x0, __m256& bad, __m256 m3) {
     using T = typename Store<P>::T;
     // Cinta móvil (sólo clase Ground): δ = 6 w_9 u_g en unidades de almacenamiento, en los carriles kGroundOnly.
     __m256 gdelta = _mm256_setzero_ps(), mg = _mm256_setzero_ps();
@@ -401,7 +459,8 @@ CFD_INLINE void block_vec(const KCtx& k, i64 n0, int x0, __m256& bad) {
         const f8 omw = wall_omc(u2, f8::load(k.tau0 + x0), f8(k.wallC3), omc, f8(k.wall_floor));
         omc = _mm256_blendv_ps(omc, omw, mw);
     }
-    if constexpr (Masked) omc = _mm256_andnot_ps(meq, omc);
+    f8 omcb = f8(k.omcb);   // (sólo con Bulk)
+    if constexpr (Masked) { omc = _mm256_andnot_ps(meq, omc); if constexpr (Bulk) omcb = _mm256_andnot_ps(meq, omcb); }
 
     // Detección barata de divergencia: ρ fuera de (0.2, 5) o NaN (comparaciones no ordenadas).
     {
@@ -439,11 +498,12 @@ CFD_INLINE void block_vec(const KCtx& k, i64 n0, int x0, __m256& bad) {
             _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), h);
         }
     };
-    collide<C, kSc<P>>(ld, st, drho, rho, ux, uy, uz, q, omc);
+    // Término de 3er orden de la RR: (1−ω) salvo en la capa junto a los cuerpos (m3 = 0 en todo el bloque).
+    collide<C, kSc<P>, Bulk>(ld, st, drho, rho, ux, uy, uz, q, omc, omcb, f8(_mm256_and_ps(omc, m3)));
 }
 
 // ---- Par de bloques puros (16 celdas) con cadenas entrelazadas -------------------------------
-template <Precision P, Collision C, bool Macro>
+template <Precision P, Collision C, bool Macro, bool Bulk>
 CFD_INLINE void block_vec2(const KCtx& k, i64 n0, int x0, __m256& bad) {
     auto ld1 = [&](int i, i64 n) -> f8 {
         if constexpr (P == Precision::FP32) return f8::load(static_cast<const float*>(k.ld[i]) + n);
@@ -476,7 +536,7 @@ CFD_INLINE void block_vec2(const KCtx& k, i64 n0, int x0, __m256& bad) {
                               _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
     };
     auto st = [&](int i, f8x2 v) { st1(i, n0, v.a); st1(i, n0 + 8, v.b); };
-    collide<C, kSc<P>>(ld, st, drho, rho, ux, uy, uz, q, omc);
+    collide<C, kSc<P>, Bulk>(ld, st, drho, rho, ux, uy, uz, q, omc, f8x2(k.omcb), omc);
 }
 
 // ---- Ruta escalar (bloques con paredes móviles cerca; poco frecuente) ------------------------
@@ -498,7 +558,7 @@ CFD_INLINE void macro_solid(const KCtx& k, i64 n, u8 fl, int x, int y, int z) {
     k.rho[n] = 1.0f; k.ux[n] = u.x; k.uy[n] = u.y; k.uz[n] = u.z;
 }
 
-template <Precision P, Collision C, bool Macro>
+template <Precision P, Collision C, bool Macro, bool Bulk>
 CFD_NOINLINE u32 block_scalar(const KCtx& k, i64 n0, int x0, int y, int z) {
     u32 bad = 0;
     float pux = 0.0f, puy = 0.0f, puz = 0.0f;   // u (pre-colisión) de la celda x-1
@@ -566,11 +626,12 @@ CFD_NOINLINE u32 block_scalar(const KCtx& k, i64 n0, int x0, int y, int z) {
             if (nmov) ur -= uwall * (1.0f / static_cast<float>(nmov));
             omc = wall_omc(dot(ur, ur), k.tau0[x], k.wallC3, omc, k.wall_floor);
         }
-        if (eq) omc = 0.0f;
+        float omcb = k.omcb;
+        if (eq) omc = omcb = 0.0f;
         bad |= !(rho > 0.2f && rho < 5.0f);
         if constexpr (Macro) { k.rho[n] = rho; k.ux[n] = ux; k.uy[n] = uy; k.uz[n] = uz; }
         auto stf = [&](int i, float v) { store_s<P>(k.st[i], n, v); };
-        collide<C, kSc<P>>(ldf, stf, drho, rho, ux, uy, uz, q, omc);
+        collide<C, kSc<P>, Bulk>(ldf, stf, drho, rho, ux, uy, uz, q, omc, omcb, (fl & kLayer) ? 0.0f : omc);
     }
     return bad;
 }
@@ -588,7 +649,7 @@ CFD_INLINE void block_skip_macro(const KCtx& k, i64 n0, int x0, int y, int z) {
 }
 
 // Recorre un rango de filas (y,z). Una fila = nx/8 bloques; la clase de cada bloque decide la ruta.
-template <Precision P, Collision C, bool Macro>
+template <Precision P, Collision C, bool Macro, bool Bulk>
 CFD_HOT void rows_kernel(const KCtx& k, i64 r0, i64 r1) {
     // FTZ|DAZ: los subnormales disparan asistencias de microcódigo (~100+ ciclos). MXCSR es por
     // hilo: se activa al entrar y se restaura al salir (2 ldmxcsr por trozo de ~4096 celdas).
@@ -605,18 +666,20 @@ CFD_HOT void rows_kernel(const KCtx& k, i64 r0, i64 r1) {
             const i64 n0 = nrow + 8 * b;
             const int x0 = 8 * b;
             if (k.pair && cls[b] == kBlkPure && b + 1 < k.nbx && cls[b + 1] == kBlkPure) {
-                block_vec2<P, C, Macro>(k, n0, x0, bad);
+                block_vec2<P, C, Macro, Bulk>(k, n0, x0, bad);
                 ++b;
                 continue;
             }
-            switch (cls[b]) {
-            case kBlkPure: block_vec<P, C, Macro, false>(k, n0, x0, bad); break;
-            case kBlkMasked: block_vec<P, C, Macro, true>(k, n0, x0, bad); break;
-            case kBlkGround: block_vec<P, C, Macro, true, true>(k, n0, x0, bad); break;
-            case kBlkPure | kBlkWall: block_vec<P, C, Macro, false, false, true>(k, n0, x0, bad); break;
-            case kBlkMasked | kBlkWall: block_vec<P, C, Macro, true, false, true>(k, n0, x0, bad); break;
-            case kBlkGround | kBlkWall: block_vec<P, C, Macro, true, true, true>(k, n0, x0, bad); break;
-            case kBlkScalar: badflag |= block_scalar<P, C, Macro>(k, n0, x0, y, z); break;
+            const u8 c = cls[b];
+            const __m256 m3 = (c & kBlkLayer) ? _mm256_setzero_ps() : _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+            switch (c & ~kBlkLayer) {
+            case kBlkPure: block_vec<P, C, Macro, Bulk, false>(k, n0, x0, bad, m3); break;
+            case kBlkMasked: block_vec<P, C, Macro, Bulk, true>(k, n0, x0, bad, m3); break;
+            case kBlkGround: block_vec<P, C, Macro, Bulk, true, true>(k, n0, x0, bad, m3); break;
+            case kBlkPure | kBlkWall: block_vec<P, C, Macro, Bulk, false, false, true>(k, n0, x0, bad, m3); break;
+            case kBlkMasked | kBlkWall: block_vec<P, C, Macro, Bulk, true, false, true>(k, n0, x0, bad, m3); break;
+            case kBlkGround | kBlkWall: block_vec<P, C, Macro, Bulk, true, true, true>(k, n0, x0, bad, m3); break;
+            case kBlkScalar: badflag |= block_scalar<P, C, Macro, Bulk>(k, n0, x0, y, z); break;
             default:
                 if constexpr (Macro) block_skip_macro(k, n0, x0, y, z);
                 break;
@@ -631,8 +694,14 @@ CFD_HOT void rows_kernel(const KCtx& k, i64 r0, i64 r1) {
 
 using RowsFn = void (*)(const KCtx&, i64, i64);
 
+// Bulk: viscosidad de volumen propia (constante del paso) → plantilla, para que la traza no dependa de ω (ver collide).
+// BGK no la usa: sólo se instancia sin ella.
 template <Precision P, Collision C>
-constexpr RowsFn pick_rows(bool macro) { return macro ? &rows_kernel<P, C, true> : &rows_kernel<P, C, false>; }
+constexpr RowsFn pick_rows(bool macro, bool bulk) {
+    if constexpr (C == Collision::BGK) return macro ? &rows_kernel<P, C, true, false> : &rows_kernel<P, C, false, false>;
+    else if (bulk) return macro ? &rows_kernel<P, C, true, true> : &rows_kernel<P, C, false, true>;
+    else return macro ? &rows_kernel<P, C, true, false> : &rows_kernel<P, C, false, false>;
+}
 
 // ---- Fuerzas por intercambio de momento --------------------------------------------------------
 // Lista compacta de sólidos con vecinos fluidos: máscara de enlaces (bit k = el fluido está en s - c_k)
@@ -907,6 +976,46 @@ void Solver::Impl::rebuild(bool transitions) {
             }
         });
     }
+    // 3b) Capa junto a los cuerpos (sólo con la colisión recursiva): dilatación de Chebyshev de radio L de los sólidos
+    //     que no son el suelo (3 pasadas separables x, y, z sobre una máscara de bytes), extendida a bloques completos de
+    //     8 celdas en x (el kernel AVX2 decide por bloque; la iGPU lee el bit por celda: mismo resultado).
+    if (cfg.collision == Collision::Recursive && cfg.rr_wall_layer > 0) {
+        const int Lw = cfg.rr_wall_layer;
+        std::vector<u8> a(static_cast<usize>(N)), b(static_cast<usize>(N));
+        parallel_for(0, N, 1 << 15, [&](i64 lo, i64 hi) {
+            for (i64 n = lo; n < hi; ++n) a[static_cast<usize>(n)] = (F[n] & kSolid) && !(SI[n] == k_ground_id && n < nxny);
+        });
+        // Máximo deslizante de radio Lw a lo largo de un eje (zancada st, longitud len): dst[j] = OR de src[j−Lw..j+Lw]
+        // (distancia a la última celda marcada por delante y por detrás).
+        auto pass = [&](const std::vector<u8>& src, std::vector<u8>& dst, i64 st, int len, i64 nlines, auto base_of) {
+            parallel_for(0, nlines, 16, [&](i64 l0, i64 l1) {
+                std::vector<int> fw(static_cast<usize>(len));
+                for (i64 l = l0; l < l1; ++l) {
+                    const i64 b0 = base_of(l);
+                    int d = 1 << 20;
+                    for (int i = 0; i < len; ++i) { d = src[static_cast<usize>(b0 + i * st)] ? 0 : d + 1; fw[static_cast<usize>(i)] = d; }
+                    d = 1 << 20;
+                    for (int i = len - 1; i >= 0; --i) {
+                        d = src[static_cast<usize>(b0 + i * st)] ? 0 : d + 1;
+                        dst[static_cast<usize>(b0 + i * st)] = std::min(d, fw[static_cast<usize>(i)]) <= Lw;
+                    }
+                }
+            });
+        };
+        const i64 NX = nx, NY = ny;
+        pass(a, b, 1, nx, static_cast<i64>(ny) * nz, [&](i64 l) { return l * NX; });
+        pass(b, a, NX, ny, static_cast<i64>(nx) * nz, [&](i64 l) { return (l % NX) + (l / NX) * NX * NY; });
+        pass(a, b, nxny, nz, nxny, [&](i64 l) { return l; });
+        parallel_for(0, N / 8, 1 << 12, [&](i64 lo, i64 hi) {
+            for (i64 bl = lo; bl < hi; ++bl) {
+                bool any = false;
+                for (int l = 0; l < 8; ++l) any |= b[static_cast<usize>(8 * bl + l)] != 0;
+                if (any)
+                    for (int l = 0; l < 8; ++l)
+                        if (!(F[8 * bl + l] & kSolid)) F[8 * bl + l] |= kLayer;
+            }
+        });
+    }
     // 4) Clases de bloque (SWAR sobre 8 flags) y filas activas.
     const i64 nblocks = N / 8;
     u8* CL = cls.data();
@@ -926,6 +1035,7 @@ void Solver::Impl::rebuild(bool transitions) {
             else if (nm) c = kBlkGround | wl;
             else if (w & (ones * (kSolid | kInlet | kOutlet))) c = kBlkMasked | wl;
             else c = kBlkPure | wl;
+            if (c != kBlkSkip && c != kBlkScalar && (w & (ones * kLayer))) c |= kBlkLayer;   // (escalar: por celda)
             CL[b] = c;
         }
     });
@@ -1102,6 +1212,8 @@ void Solver::Impl::run_kernel(bool macro) {
     k.wallC3 = wall_c3(cfg.wall_nu > 0.0f ? cfg.wall_nu : cfg.nu);
     k.wall_floor = kWallFloor;
     if (cfg.wall_model == WallModel::Slip) k.wallC3 = 0.0f;   // Slip: sólo el amortiguamiento del LES (ver rebuild)
+    k.bulk = cfg.bulk_omega > 0.0f;
+    k.omcb = 1.0f - std::clamp(cfg.bulk_omega, 0.0f, 1.99f);
     k.u_in = u_at(t);
     k.u_ground = motion_now[k_ground_id].v.x;
     k.nx = nx; k.ny = ny; k.nz = nz; k.nbx = nbx;
@@ -1123,8 +1235,12 @@ void Solver::Impl::run_kernel(bool macro) {
     RowsFn fn;
     const bool fp32 = cfg.precision == Precision::FP32;
     const bool reg = cfg.collision == Collision::Regularized;
-    if (fp32) fn = reg ? pick_rows<Precision::FP32, Collision::Regularized>(macro) : pick_rows<Precision::FP32, Collision::BGK>(macro);
-    else fn = reg ? pick_rows<Precision::FP16S, Collision::Regularized>(macro) : pick_rows<Precision::FP16S, Collision::BGK>(macro);
+    const bool rec = cfg.collision == Collision::Recursive;
+    const bool bk = k.bulk;
+    if (fp32) fn = rec ? pick_rows<Precision::FP32, Collision::Recursive>(macro, bk)
+                       : reg ? pick_rows<Precision::FP32, Collision::Regularized>(macro, bk) : pick_rows<Precision::FP32, Collision::BGK>(macro, bk);
+    else fn = rec ? pick_rows<Precision::FP16S, Collision::Recursive>(macro, bk)
+                  : reg ? pick_rows<Precision::FP16S, Collision::Regularized>(macro, bk) : pick_rows<Precision::FP16S, Collision::BGK>(macro, bk);
 
     i64 grain = tun.row_grain;
     if (grain <= 0) grain = std::max<i64>(1, 4096 / nx);   // ~4096 celdas por trozo (medido: 1 fila -23 %, 4 filas -7..-12 %)

@@ -161,6 +161,12 @@ struct SimConfig {
     float ramp_ft = 0.0f;
     // ---- Fase 3: backend iGPU (Vulkan de cómputo propio, src/gpu; ver docs/GPU.md) ----
     bool gpu = false;              // el solver avanza en la iGPU; la CPU sólo dibuja (en paralelo en la ventana)
+    // ---- Ruido del campo lejano (ver docs/FISICA.md §1.5 y lbm::Config) ----
+    // Regularización recursiva de 3er orden + viscosidad de volumen: con la proyección de 2º orden (Regularized) a
+    // ν = 1e-4 y u∞ = 0.09 el campo lejano se llenaba de ruido de escala de red (inestabilidad lineal del esquema).
+    lbm::Collision collision = lbm::Collision::Recursive;
+    float bulk_omega = 1.0f;       // relajación de la traza de Π^neq (viscosidad de volumen); 0 = la de la cortante
+    int rr_wall_layer = 8;         // capa (celdas) junto a los cuerpos sin el término de 3er orden (lbm::Config)
 };
 
 struct RebuildTimes { double build = 0, vox = 0, geo = 0, mesh = 0, total = 0; };

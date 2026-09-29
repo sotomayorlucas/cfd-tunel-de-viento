@@ -319,7 +319,7 @@ int main(int argc, char** argv) {
                     Solver::Tuning tt = tun;
                     tt.pair_blocks = pr;
                     Solver* sv = make_solver(nx, ny, nz, ps == "fp32" ? Precision::FP32 : Precision::FP16S,
-                                             cs == "bgk" ? Collision::BGK : Collision::Regularized, geom, tt);
+                                             cs == "bgk" ? Collision::BGK : (cs == "rr" ? Collision::Recursive : Collision::Regularized), geom, tt);
                     sv->step(2, true);
                     std::vector<double> mc, mw, fm;
                     for (int r = 0; r < runs; ++r) {
@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
                 Case c;
                 c.grid = gs; c.prec = ps; c.coll = cs; c.nx = nx; c.ny = ny; c.nz = nz;
                 c.s = make_solver(nx, ny, nz, ps == "fp32" ? Precision::FP32 : Precision::FP16S,
-                                  cs == "bgk" ? Collision::BGK : Collision::Regularized, geom, tun);
+                                  cs == "bgk" ? Collision::BGK : (cs == "rr" ? Collision::Recursive : Collision::Regularized), geom, tun);
                 c.s->step(steps, true);   // calentamiento
                 cases.push_back(std::move(c));
             }

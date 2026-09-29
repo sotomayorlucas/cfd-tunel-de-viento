@@ -30,10 +30,16 @@ Resumen honesto en tres líneas:
   (tests/test_lbm.cpp, pruebas 2a-2j).
 * **FP16S**: se guardan las poblaciones *desplazadas* f̃ = f − w escaladas por 2¹⁵ en IEEE half (F16C); la
   aritmética es FP32. Diferencia con FP32 en el Cd de una esfera a Re = 100: 0.27 % (prueba 6 de test_lbm).
-* **Colisión regularizada** (proyección de Hermite de 2.º orden del no-equilibrio: filtra los modos no
-  hidrodinámicos) + **Smagorinsky** (LES) con C_s = **0.10** (el valor clásico para flujos de cizalla; con
-  0.16 la capa límite engordaba y se despegaba antes). La viscosidad turbulenta sale del tensor de no
-  equilibrio local (sin diferencias finitas).
+* **Colisión regularizada RECURSIVA** (`lbm::Collision::Recursive`, Malaspinas 2015; Coreixas et al., PRE 96,
+  033306, 2017): el no equilibrio se reconstruye con su parte de 2.º orden (Π^neq, proyección de Hermite) **y** la de
+  3er orden obtenida recursivamente de Π^neq (a3neq_αβγ = u_α Π_βγ + u_β Π_αγ + u_γ Π_αβ, en las 6 combinaciones
+  de 3er orden que soporta D3Q19). Con sólo la proyección de 2.º orden (`Regularized`, el esquema anterior) el
+  solver era **linealmente inestable** a ν = 1·10⁻⁴ con u∞ = 0.09: ver §1.5. Más **viscosidad de volumen** propia
+  (`Config::bulk_omega` = 1: la traza de Π^neq se relaja con ω_b = 1, ν_b = 1/9 en red), que amortigua el sonido y
+  el modo par/impar sin tocar la cortante (sólo actúa sobre ∇·u). En una **capa de 8 celdas junto a los cuerpos**
+  se mantiene la proyección de 2.º orden (con la que se calibró la física de pared, §1.5). + **Smagorinsky** (LES) con C_s = **0.10** (el
+  valor clásico para flujos de cizalla; con 0.16 la capa límite engordaba y se despegaba antes). La viscosidad
+  turbulenta sale del tensor de no equilibrio local (sin diferencias finitas).
 * Viscosidad molecular de red por defecto **ν = 1·10⁻⁴** (τ = 0.5003). Da las mismas fuerzas que 1·10⁻⁵
   (NACA 0012 a 6°: CL 0.274 frente a 0.277) con 10× más margen de estabilidad. Con 3·10⁻⁴ la resistencia
   ya sube un 3 %.
@@ -53,9 +59,12 @@ Resumen honesto en tres líneas:
   túnel real, `Sim::rho_ref` da la "toma estática" (ρ medio de un plano a mitad de camino entre la
   entrada y el objeto).
 * **Arranque impulsivo** (u = u∞ en todo el fluido desde el paso 0). Genera un pulso acústico que se va
-  en ~0.3 pasos de flujo (RMS de Cp en todo el fluido del F1 2022 a Rápida: 0.30 a 0.12 PF, 0.18 a 0.25
-  PF, 0.14 a 0.38 PF, 0.13 estable). Una rampa desde el reposo es peor: con 0.1 PF el RMS sigue en 0.23 a
-  los 2 PF (el túnel tiene que "llenarse"). Las fuerzas del primer ½ paso de flujo no se promedian.
+  en ~0.4 pasos de flujo (RMS de Cp en todo el fluido del F1 2022 a Rápida, `tools/noise_probe`: 0.26 a 0.12 PF,
+  0.16 a 0.25 PF, 0.14 a 0.37 PF y 0.13 estable —el campo de presión del propio coche—; antes de la corrección de
+  §1.5 bajaba a 0.14 y volvía a SUBIR a 0.18-0.19 por el ruido). Una rampa desde el reposo sigue siendo mucho peor
+  también con el esquema nuevo (el túnel tiene que "llenarse" de forma compresible): con 0.1 o 0.3 PF de rampa, a
+  los 2.5 PF el Cp medio 40 celdas aguas arriba del F1 2022 sigue en +0.55-0.59 (impulsivo: +0.21 estable desde
+  0.4 PF) y en la esfera en +1.9. Las fuerzas del primer ½ paso de flujo no se promedian.
 * **Recuperación automática**: si el solver detecta NaN o ρ fuera de (0.2, 5), `Sim::step` triplica la
   viscosidad y reinicia el flujo (la app lo avisa).
 
@@ -106,6 +115,113 @@ a sotavento de cada escalón descendente, la primera celda queda casi parada: co
 
 Otros modelos disponibles (`--wall`): `none` (rebote no deslizante con LES) y `log` (ley de pared por
 viscosidad en la primera celda).
+
+### 1.5 Ruido del campo lejano: diagnóstico y corrección
+
+**Síntoma** (revisión de la fase 2): con los defectos (ν = 1·10⁻⁴, τ = 0.5003, u∞ = 0.09, C_s = 0.10) el campo
+lejano estaba lleno de ruido de escala de red: dameros en los cortes de Cp, bandas en |u|, criterio Q positivo en
+todo el dominio (el umbral de vórtices tuvo que subirse a 600 en los coches).
+
+**Medida** (`tools/noise_probe`, ver su cabecera): regiones UPin (x = 2-6), UP40 (~40 celdas aguas arriba del
+objeto), SIDE y TOP (franjas del 10 % junto a los laterales y el techo, antes de la esponja); RMS espacial de u_x/U − 1
+y de Cp, cociente de paso alto hp = RMS(φ − media de los 6 vecinos)/σ(φ) (≈ 0 suave, ≈ 1 ruido blanco, 2 damero),
+σ temporal por celda en los últimos 0.5 PF y la segunda diferencia temporal d2t = RMS(φ_{t+1} − ½(φ_t + φ_{t+2}))
+(grande si hay una oscilación de periodo 2 pasos, la firma de ω ≈ 2).
+
+**Causa.** No eran (principalmente) reflexiones en las caras: el **túnel VACÍO** con cinta, sin ningún cuerpo, se
+llenaba solo. El RMS de u_y,u_z crecía ×10 cada 250 pasos desde la entrada y saturaba en **±38 % de u∞**
+(sólo lo contenía la viscosidad de Smagorinsky que el propio ruido activa; con C_s = 0 divergía). Sin suelo quedaba
+limpio... hasta que se le daba una semilla (un cubo de 6 celdas durante 100 pasos): entonces se llenaba igual.
+Es la **inestabilidad lineal de la regularización de 2.º orden** (PR) a ν → 0 con Ma ≈ 0.16: el no equilibrio
+de 3er orden se pone a cero en cada paso y los modos que no ve la proyección no se amortiguan. Mapa de estabilidad
+del túnel vacío (376×100×68, 3000 pasos, sembrado con el cubo o con la cinta, que siembra sola):
+
+| Esquema | u∞ = 0.07 | 0.09 | 0.11 | 0.13 | 0.16 | 0.20 |
+|---|---|---|---|---|---|---|
+| PR (anterior) | ruido 30 % | **38 %** | | | | |
+| PR + ν_b (ω_b = 1) | | 36 % (tarda más en crecer) | | | | |
+| PR con ν = 3·10⁻⁴ / 1·10⁻³ | | estable | | | | |
+| RR (no equilibrio de 3er orden) | | estable | 1 % | 1 % | | |
+| sólo el equilibrio de 3er orden (ρuuu) + ν_b, sin el no equilibrio | | **23 %** | | 30 % | | |
+| **RR + ν_b** | | estable | | estable | estable | **estable** (también sin LES) |
+
+(Ruido = RMS de u_⊥/u∞ tras 3000 pasos; "estable" = la semilla se va aguas abajo y el campo vuelve a ~10⁻⁴.) La
+parte que estabiliza es el **no equilibrio** de 3er orden; su equilibrio (ρuuu) no aporta nada y no se usa. La
+viscosidad de volumen añade margen para las zonas rápidas junto a los cuerpos (u ≈ 1.5-2 u∞ en las succiones) y
+amortigua el sonido: sin ella queda un modo acústico de periodo 2 (σ_t(Cp) = 0.05 aguas arriba del F1 2026).
+Otras hipótesis, medidas: FP16S (en FP32 igual), la esponja (sin esponja igual), reflexiones de las caras de
+equilibrio (el túnel vacío sin semilla ni cinta está limpio: no generan ruido; tras la corrección los modos acústicos
+del túnel que quedan son de ~10⁻³ en Cp → no se añadieron capas absorbentes: no queda nada que absorber) y el
+arranque (una rampa sigue siendo peor, §1.2).
+
+**Antes / después** (Rápida, 2.5 PF desde el arranque impulsivo, FP16S; CPU y GPU dan lo mismo a 3 cifras):
+
+| Caso · región | RMS(u_x/U − 1) | σ espacial Cp · hp | σ_t(u_x/U) | σ_t(Cp) | d2t(Cp) |
+|---|---|---|---|---|---|
+| túnel vacío (dominio del F1 2026) · UP40 | 5.3 % → **0.05 %** | 0.160 · 0.98 → 0.0002 | 0.039 → 0.0000 | 0.137 → 0.0001 | 0.24 → 0.0001 |
+| túnel vacío · SIDE | 4.9 % → 0.05 % | 0.114 → 0.0003 | 0.032 → 0.0000 | 0.082 → 0.0001 | 0.19 → 0.0002 |
+| F1 2026 · UPin | 2.5 % → 0.9 % | 0.122 · 0.91 → 0.016 · 0.03 | 0.020 → 0.0001 | 0.100 → **0.0011** | 0.18 → 0.0005 |
+| F1 2026 · UP40 | 5.7 % → 1.4 % | 0.154 · 1.04 → 0.017 · 0.04 | 0.048 → 0.0003 | 0.139 → **0.0013** | 0.25 → 0.0008 |
+| F1 2026 · SIDE / TOP | 10.3 / 9.4 % → 7.8 / 6.5 % | 0.19 / 0.18 · 0.94 → 0.10 / 0.09 · 0.01 | 0.057 → 0.007 | 0.145 → 0.004 | 0.27 → 0.0010 |
+| F1 2022 · UP40 | 6.1 % → 1.5 % | 0.153 · 1.03 → 0.017 · 0.04 | 0.046 → 0.0003 | 0.139 → 0.0013 | 0.25 → 0.0008 |
+| NACA 0012 6° · UPin | 3.2 % → 0.15 % | 0.167 · 0.89 → 0.022 · 0.02 | 0.023 → 0.0001 | 0.141 → 0.0012 | 0.25 → 0.0005 |
+| esfera · UP40 | 0.8 % → 0.2 % | 0.032 · 0.71 → 0.010 · 0.07 | 0.007 → 0.002 | 0.064 → 0.020 | 0.034 → 0.0008 |
+
+Lo que queda en UP40/SIDE/TOP con un cuerpo es **estacionario y suave** (hp ≈ 0.01-0.04): el Cp de bloqueo aguas
+arriba (+0.2 en los coches, ver §1.2) y la aceleración del flujo a los lados del coche (u ≈ 1.07 U junto a las
+paredes laterales). En la esfera queda una oscilación global de Cp aguas arriba (σ_t 0.02, periodos de 74 y 148
+pasos): un modo acústico del túnel excitado por la estela (las caras de equilibrio reflejan), 3× menor que antes.
+Espectro de u_x a lo largo de y 40 celdas aguas arriba del F1 2026: energía en k > ½k_Nyquist 9 % → 3 %; sonda de
+Cp: de periodos de 21-42 pasos (ruido) a 650-680 (el tránsito acústico del túnel, nx/c_s = 651).
+
+("Después" = esquema final, con la capa de abajo; sin capa el campo lejano da lo mismo a 2 cifras. En todo el
+fluido del NACA el cociente de paso alto de Cp queda en 0.39 (antes 0.92; sin capa 0.09): algo de ruido de escala
+de red sobrevive dentro de la capa de 2.º orden, junto al ala y en los torbellinos de punta.)
+
+**La RR también cambia la física de pared → capa de 2.º orden junto a los cuerpos.** Con la RR en TODO el dominio
+el campo lejano quedaba igual de limpio, pero cambiaba la calibración mucho más que el ruido de una tanda
+(Media, 4-5 PF, media de los 2 últimos): NACA 0012 a 6° CL 0.30 → **0.13** (la sustentación cae de forma continua
+de 0.29 a 0.10 en 6 PF: desprendimiento desde el borde de ataque en la cara de succión), ala en efecto suelo a 60 mm
+1.05 → 0.70, Ahmed CL −0.29 → +0.82, F1 2022 SCz 0.59 → 1.06. Descartado que fuera el campo lejano limpio: con la
+proyección de 2.º orden a ν = 3·10⁻⁴ (estable, sin ruido) el NACA mantiene CL 0.29 y con la RR a esa misma ν cae a
+0.09; la viscosidad de volumen no influye (0.22 con y sin ella). La causa es la RR dentro de la capa límite y las
+capas de cortadura a estas resoluciones (menos disipación de los momentos de 3er orden en zonas mal resueltas; la ley
+de pared y la calibración se hicieron con la proyección de 2.º orden). Solución: `Config::rr_wall_layer` = **8**
+celdas: en una capa de Chebyshev de 8 celdas alrededor de los sólidos que no son el suelo (extendida a bloques de 8
+en x; bit interno `kLayer` de los flags, también en la iGPU) la colisión no añade el término de 3er orden. Medido
+(NACA 0012 a 6°, Media, CL a 6 PF): sólo la 1.ª celda 0.22, capa de 3 celdas 0.17 y bajando, 6 celdas 0.31 estable
+(= 2.º orden). F1 2022 a Rápida, SCz (2.º orden con ruido: 0.50): capa 6 → 0.73, **8 → 0.51**, 12 → 0.46, 24 → 0.35.
+Ruido del F1 2026 con la capa: 6-8 celdas igual que sin capa; 12 empieza a reaparecer junto al coche (d2t(Cp) 2.5e-3
+en SIDE); 24 vuelve (d2t 0.043): la inestabilidad crece dentro de una capa de 2.º orden gruesa.
+
+**Calibración antes / después** (Media, `tools/noise_probe --calib 2`, 4 PF coches / 5 objetos, media de los 2
+últimos; "antes" = árbol anterior medido igual, reproduce la tabla de §5.1 dentro del ruido: F1 2022 0.59 / 2.04
+frente a 0.62 / 2.01):
+
+| Caso | antes | después (RR + ν_b + capa 8) | RR sin capa |
+|---|---|---|---|
+| F1 2022 SCz / SCx (m²) | 0.59 / 2.04 (bal. 22 %) | **0.82 / 2.15** (bal. 35 %) | 1.06 / 2.15 |
+| F1 1967 SCz / SCx | −0.22 / 0.95 | −0.19 / 1.02 | −0.17 / 1.00 |
+| ala en efecto suelo, 60 mm, CL / CD | 1.05 / 0.355 | 1.21 / 0.384 | 0.70 / 0.306 |
+| ala en efecto suelo, 300 mm, CL / CD | 0.86 / 0.255 | 0.92 / 0.278 | 0.81 / 0.249 |
+| NACA 0012 6°, CL / CD | 0.295 / 0.082 | **0.301 / 0.083** | 0.132 / 0.080 |
+| esfera CD | 0.349 | 0.367 | 0.257 |
+| Ahmed 25°, CD / CL | 0.659 / −0.29 | 0.619 / +0.10 | 0.710 / +0.82 |
+
+Lectura honesta: el NACA 0012 (ala libre, el caso más limpio) no cambia. La esfera y los coches suben la resistencia
+un 5-8 % (no baja: el ruido NO era la causa del exceso de resistencia de §5); el Ahmed la baja un 6 %. Las cargas que
+dependen de aire limpio delante (alerón delantero del F1 2022 0.50 → 0.63 m², fondo −0.06 → +0.11; ala en efecto
+suelo +7..16 %) suben más que el ruido de una tanda (±0.05-0.1 m²): antes trabajaban en un "flujo libre" con ±38 % de
+fluctuación espuria. La tabla de §5.1 es la del esquema anterior; con el nuevo, F1 2022 a Media = 0.82 / 2.15 m².
+
+Capturas antes/después (sin ventana, Rápida, 2.5 PF): `build/app/shots/noise/` (cortes de Cp del ala en efecto suelo
+y del F1 2022, |u| del perfil pseudo-2D, Cp en superficie del NACA 0012, vórtices Q del F1 2026 con umbral 150 y del
+F1 2022 con el nuevo umbral por defecto). Umbral de vórtices por defecto (Q·L²/U²): coches 600 → **300**, cuerpos 800 →
+**400**; alas libres se quedan en 30 porque con menos aparece el ruido que queda dentro de la capa junto al ala.
+
+Coste: ver docs/opt/lbm.md §5 y docs/GPU.md (CPU: por núcleo llvm-mca 129 → 131 ciclos por bloque de 8 en FP16S;
+iGPU: el kernel de celdas pasa de ~7 a ~9 ms/paso a Media, +20 % de instrucciones y algunos derrames de registros en
+el modo de 2 celdas por hilo).
 
 ---------------------------------------------------------------------------------------------------
 
@@ -362,6 +478,7 @@ Media 0.27 / 0.30, Alta 0.31 / 0.29, Ultra 0.36 / 0.26; NACA 0012 a 6°: Rápida
 | C_s (Smagorinsky) | 0.10 | `--cs` | 0.16 engorda la capa límite (sección 1.1) |
 | Modelo de pared | Slip | `--wall none\|log\|slip` | sección 1.4 |
 | Rebote | interpolado (Bouzidi) | `--bb interp\|implicit` | el modelo Slip requiere el interpolado |
+| Colisión | regularizada recursiva (RR) + ν_b (ω_b = 1), capa de 2.º orden de 8 celdas junto a los cuerpos | — (`lbm::Config::collision/bulk_omega/rr_wall_layer`) | §1.1 y §1.5 |
 | Arranque | impulsivo | `--ramp PF` | una rampa desde el reposo tarda > 5 PF en asentarse |
 | Esponja | 12 % final en x, ν → 0.12 | — | |
 | Hueco mínimo bajo el fondo | 3.5 celdas | — | `Sim::k_gap_cells` (sección 3) |
