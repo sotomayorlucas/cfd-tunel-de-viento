@@ -41,7 +41,7 @@ pesados de fondo en esta máquina: qemu, rustc — los benchmarks deben repetirs
 |---|---|---|
 | core | `src/core/*` (ya hecho) | `config.hpp` macros, `mathx.hpp`, `simd.hpp` (f8/i8x AVX2, FP16), `mem.hpp` (Buffer alineado + THP, Arena, Padded), `threadpool.hpp`, `util.hpp` (tiempo, WyRand, bits, PDEP Morton), `png.hpp` |
 | geom/sdf | `src/geom/sdf.*`, `lattice_map.hpp` (ya hecho) | escena SDF de grupos + primitivas + CSG + marcos |
-| **lbm** | `src/lbm/*` (salvo `field.hpp`), `tests/test_lbm*.cpp`, `tools/bench_lbm.cpp` | `lbm/solver.hpp` |
+| **lbm** | `src/lbm/*` (salvo `field.hpp`), `tests/test_lbm*.cpp`, `tests/test_refine.cpp`, `tools/bench_lbm.cpp`, `tools/calib.cpp` | `lbm/solver.hpp`. Privados: `kernel.hpp` (colisión/momentos genéricos), `solver_impl.hpp` (`Solver::Impl`, una por rejilla), `refine.cpp` (refinamiento local por bloques 2:1: interfaces y paso recursivo; docs/FISICA.md §1.6) |
 | **geom (voxel+malla)** | `src/geom/voxelizer.cpp`, `src/geom/mesher.cpp`, `tests/test_geom*.cpp` | `geom/voxelizer.hpp` |
 | **models** | `src/models/*.cpp`, `tools/model_preview.cpp`, `tests/test_models*.cpp` | `models/model.hpp` |
 | **render core** | `src/render/raster.cpp`, `src/render/colormap.hpp`, `tests/test_raster*.cpp` | `render/raster.hpp` |
@@ -60,7 +60,9 @@ compatible y documentarlo en el informe): `lbm/field.hpp`, `render/framebuffer.h
 1. `platform->poll(input)` → UI inmediata (panel derecho) + controles de cámara.
 2. Si cambió geometría/params: `models::build` → `geom::voxelize` → `solver.set_geometry`
    (el flujo continúa, no se resetea) → `geom::mesh_scene` (malla suave para render).
-3. `solver.step(k)` con `k` adaptativo para mantener ~30 FPS (el último paso escribe ρ,u).
+3. `solver.step(k)` con `k` adaptativo para mantener ~30 FPS (el último paso escribe ρ,u). Con refinamiento local
+   (`--refine`, defecto en los F1) cada paso de la red base avanza 2/4 subpasos las cajas finas; la visualización usa
+   el campo compuesto `flowvis::MultiField` (`Sim::multi_field()`: la rejilla más fina en cada punto).
 4. Fuerzas → media exponencial → Cl, Cd, SCz, SCx, balance, desglose por componente.
 5. Render: fondo → suelo (cinta animada / huella de Cp) → malla coloreada (Cp, |u|,
    componente) → planos de corte → líneas de corriente / partículas de humo → volumen de

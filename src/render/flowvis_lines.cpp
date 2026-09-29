@@ -87,6 +87,16 @@ struct PackedSampler {
     CFD_INLINE __m128 sample(__m128 p) const { return s.sample(p); }
     CFD_INLINE bool outside(__m128 p) const { return s.outside(p); }
     CFD_INLINE bool solid(__m128 p) const { return s.solid(p); }
+    CFD_INLINE void prefetch(float x, float y, float z) const { s.prefetch(x, y, z); }
+    int nx() const { return s.nx; }
+    float u_inf() const { return s.u_inf; }
+};
+struct MultiAdapter {   // refinamiento local: la rejilla más fina en cada punto
+    const MultiSampler& s;
+    CFD_INLINE __m128 sample(__m128 p) const { return s.sample(p); }
+    CFD_INLINE bool outside(__m128 p) const { return s.outside(p); }
+    CFD_INLINE bool solid(__m128 p) const { return s.solid(p); }
+    CFD_INLINE void prefetch(float x, float y, float z) const { s.prefetch(x, y, z); }
     int nx() const { return s.nx; }
     float u_inf() const { return s.u_inf; }
 };
@@ -308,6 +318,10 @@ void Streamlines::compute(const FlowSampler& s) {
     if (!s.ready()) { n_lines_ = 0; return; }
     compute_impl(PackedSampler{s});
 }
+void Streamlines::compute(const MultiSampler& s) {
+    if (!s.ready()) { n_lines_ = 0; return; }
+    compute_impl(MultiAdapter{s});
+}
 void Streamlines::compute_reference(const FieldView& f) {
     if (!f.valid() || !f.flags) { n_lines_ = 0; return; }
     compute_impl(RefSampler(f));
@@ -357,11 +371,21 @@ void Particles::reset() {
 void Particles::step(const FlowSampler& s, float lattice_steps) {
     ensure_capacity();
     if (!s.ready()) return;
+    step_impl(PackedSampler{s}, lattice_steps);
+}
+void Particles::step(const MultiSampler& s, float lattice_steps) {
+    ensure_capacity();
+    if (!s.ready()) return;
+    step_impl(MultiAdapter{s}, lattice_steps);
+}
+
+template <class S>
+void Particles::step_impl(const S& s, float lattice_steps) {
     if (!rng_init_) { rng_ = params.seed; rng_init_ = true; }
     const float dt = lattice_steps * params.time_scale;
     if (!(dt > 0.0f)) return;   // pausa: se conserva la salida anterior
-    const float u = s.u_inf;
-    age_max_eff_ = params.max_age > 0.0f ? params.max_age : 1.25f * static_cast<float>(s.nx) / u;
+    const float u = s.u_inf();
+    age_max_eff_ = params.max_age > 0.0f ? params.max_age : 1.25f * static_cast<float>(s.nx()) / u;
     rate_eff_ = params.rate > 0.0f ? params.rate : 0.85f * static_cast<float>(cap_) / age_max_eff_;
     const float amax = age_max_eff_;
 

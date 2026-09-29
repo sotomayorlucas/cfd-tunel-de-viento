@@ -6,7 +6,12 @@ marcha efectiva** que impone la resolución, la **tabla de calibración** medida
 sobre todo, **qué se puede y qué no se puede predecir** con él. Todo lo que aquí aparece como número
 está medido con el propio programa (se indica el caso y la resolución).
 
-Resumen honesto en tres líneas:
+**Refinamiento local (§1.6, defecto de los F1):** cajas 2 y 4 veces más finas alrededor del coche, de los alerones y del
+fondo con el mismo presupuesto de celdas. A Media el F1 2022 pasa de SCz 0.83 a **1.40 m²** (alerón delantero ×2), la
+altura efectiva de 125/175 a **47/97 mm** (38/88 a Alta) y el DRS quita el doble de resistencia; el fondo sigue sin cargar
+y la carga total es aún ~⅓ de la real. Las tablas de §5.1 son de la red uniforme; ver §5.0 para antes/después.
+
+Resumen honesto en tres líneas (red uniforme):
 
 * Es un LBM D3Q19 con LES y ley de pared a **resoluciones de centímetros** (dx = 21-48 mm en un F1). Las
   **tendencias** (efecto suelo, DRS, guiñada, alturas, flaps, épocas con/sin alerones) son útiles; los
@@ -223,6 +228,86 @@ Coste: ver docs/opt/lbm.md §5 y docs/GPU.md (CPU: por núcleo llvm-mca 129 → 
 iGPU: el kernel de celdas pasa de ~7 a ~9 ms/paso a Media, +20 % de instrucciones y algunos derrames de registros en
 el modo de 2 celdas por hilo).
 
+### 1.6 Refinamiento local por bloques (`lbm/refine.cpp`, `--refine 0|1|2`)
+
+**Por qué.** Con una red uniforme de 27-36 mm un alerón de F1 tiene 7-10 celdas de cuerda y el hueco suelo-fondo de
+30 mm es menos de una celda (§3, §4): el techo de la carga era la resolución. El refinamiento pone celdas 2 y 4 veces más
+finas sólo donde hace falta.
+
+**Estructura.** Bloques anidados 2:1 **centrados en celdas**: una caja cubre las celdas [lo, hi] de su padre y parte cada
+una en 2×2×2 (la celda fina i está en lo − ¾ + ½·i del padre). Cada nivel es una rejilla uniforme completa (otra
+`Solver::Impl`) con **el mismo kernel** AVX2 Esoteric-Pull (FP16S, RR + ν_b + Smagorinsky, clases de bloque), el mismo
+contorno (Bouzidi + modelo Slip, cinta, ruedas) y la misma pasada de fuerzas. Automático (`plan_refined`, app):
+
+* **Nivel 1** = envolvente del objeto sobre los deslizadores (sin la guiñada) + márgenes (coche: 0.15 m delante, 0.45 m
+  detrás, 0.12 m a los lados, 0.20 m arriba), **apoyada en el suelo** (su capa z = 0 es la cinta: el suelo se resuelve
+  con la dx fina).
+* **Nivel 2** (F1): alerón delantero (hasta el suelo), **fondo + difusor** (la franja bajo el coche, hasta 22 cm sobre el
+  fondo; en el 1979, los pontones-ala) y alerón trasero + beam wing; las cajas que se tocan se recortan o se fusionan.
+* Presupuesto: el de la resolución cubre **base + cajas** (N0 + N1 + N2 = celdas del preset); la dx de la base se
+  resuelve con los volúmenes de las cajas. Manual: `--refine-box x0,y0,z0,x1,y1,z1[,nivel]` (m).
+
+**Paso en el tiempo (escalado acústico).** dx/2 y dt/2 por nivel: misma u de red, ν_red ×2 (τ − ½ ×2), ν de la ley de
+pared ×2, Smagorinsky con Δ = 1 celda de cada nivel (la escala del filtro LES es la dx local), capa de 2.º orden de 8
+celdas de cada nivel, esponja sólo en la base. Cada paso del padre = 2 subpasos de la hija (recursivo).
+
+**Acoplamiento (por momentos con reescalado del no equilibrio, Dupuis & Chopard 2003 / Lagrava et al. 2012, variante
+centrada en celdas).** El estado que se intercambia es {ρ, u, X}, con X = Π^neq/(ρτ) (τ efectiva, con Smagorinsky; la
+traza con τ_b): X ∝ S·dt → **X_fina = X_gruesa/2**, y la τ de la rejilla destino sale de invertir su propio Smagorinsky
+(τ = τ0 + ¼K|X|). La población post-colisión se reconstruye con **la misma colisión regularizada** que el kernel.
+* **Grueso → fino**: una capa **fantasma** rodea cada caja fina; su post-colisión se escribe en cada subpaso con ρ, u, X
+  interpolados **trilinealmente (2.º orden)** sobre las 8 celdas del padre que rodean su centro: las activas del padre,
+  **interpoladas linealmente en el tiempo** entre T y T+1 (subpaso ½), y las cubiertas, con la media actual de sus 8 hijas.
+  Esquinas sólidas del padre: fuera de la plantilla (pesos renormalizados).
+* **Fino → grueso**: la capa de celdas cubiertas del padre junto a la interfaz ("esclavas") recibe en cada paso del padre
+  el post-colisión de la **media de sus 8 hijas** (ρ y j conservativos; Π^neq medio + la dispersión de velocidades
+  ⟨ρuu⟩ − ρ̄ūū, lo mismo que promediar las poblaciones). Las cubiertas más adentro no se procesan ni se leen.
+* **Esoteric-Pull**: fantasmas, esclavas y muertas son "sólidos con id 0": el kernel no los procesa (sus conjuntos de acceso
+  sólo los escriben las pasadas de interfaz, que escriben exactamente las direcciones que alguien lee) y no son pared
+  para el contorno ni para las fuerzas. Orden de un paso del padre en T: kernel del padre → kernel del subpaso 2T de cada
+  hija (guarda sus momentos: "taps") → esclavas post@T → fantasmas propios (antes del contorno: Bouzidi los lee) →
+  contorno → M_{T+1} (padre pre-colisión) → resto del subpaso 2T y subpaso 2T+1 de cada hija.
+* **Fuerzas**: cada rejilla hace el intercambio de momento en sus nodos; un enlace del padre cuyo punto medio cae dentro
+  de una caja fina no cuenta (lo cuenta la fina). Se suman en unidades de la base: F ∝ dx⁴/dt² → ×scale², momentos ×scale³.
+* **Masa**: el esquema por momentos **no es conservativo por construcción** (el volumétrico de Rohde et al. 2006 sí lo es,
+  pero su "explosión" uniforme es de 1.er orden y no reescala el no equilibrio, que con τ → ½ es un factor 2 entre niveles).
+  Medido en una caja cerrada con chapoteo violento (abajo): 5·10⁻⁶ de cambio relativo durante el transitorio y < 5·10⁻⁷
+  después (plano: el error viene de las ondas acústicas fuertes del arranque que cruzan la interfaz). En el túnel abierto
+  (entrada/salida fijan ρ) es irrelevante.
+
+**Validación (`tests/test_refine.cpp`, < 2 min):**
+
+| Prueba | Resultado |
+|---|---|
+| [1] flujo uniforme a través de 1 y 2 niveles (flotantes / apoyados en la cinta, FP32 / FP16S) | máx \|Δu\|/U = 1·10⁻⁷ (flotantes), 9·10⁻⁶ (cinta, tras el transitorio de arranque de la cinta, que también tiene la red uniforme), 1.5·10⁻³ en FP16S |
+| [2] masa, caja cerrada con 1 / 2 niveles, arranque impulsivo (FP32) | Δm/m: +4.7·10⁻⁶ / +6.4·10⁻⁶ en el transitorio (2000 pasos), +4·10⁻⁷ / +5·10⁻⁷ después |
+| [3] Couette plano (ν = 1/6) con el perfil lineal cruzando 1 / 2 niveles | error máx 0.93 % de U en todas las rejillas = el de la propia red base (0.92 %, caras abiertas): la interfaz no añade error medible (el perfil lineal se interpola exacto → mide el reescalado de Π^neq) |
+| [4] esfera Re = 100, D = 8 celdas en la base con caja fina (D = 16 dentro) | **Cd 1.1461** frente a 1.1453 en red uniforme fina (**0.07 %**) y 1.2492 en la gruesa (+9 %); 6 s frente a 29 s de la uniforme fina |
+| [5] pulso acústico plano contra la cara de una caja | reflexión **0.24 %** del incidente; transmitido 1.07× (la ν_b física de la fina es la mitad: se amortigua menos) |
+| [6] barra que cruza la interfaz (mitad dentro), Re 50 | Fx a 6.9 % de la uniforme fina (0.1 % con la barra entera dentro): sin doble cuenta; ver límites |
+| [7] reinicio del mismo solver refinado → uniforme | bit a bit igual a un solver nuevo |
+| [8] iGPU con refinamiento | `attach` rechaza con mensaje claro; el solver sigue en la CPU |
+
+Además `cfd --stability` con refinamiento (§7) y capturas sin ventana de cortes que cruzan las interfaces
+(`build/app/shots/refine/`: cortes compuestos y de la base sola, sin saltos visibles en las cajas; las rayas de periodo 2
+celdas sobre la cinta y sobre los pontones están también en la red uniforme).
+
+**Arreglo en la física base encontrado con el refinamiento**: un nodo de fluido cuyo centro cae justo en el umbral de la
+voxelización (d = 0.12·dx) tiene q ≈ 0 en todos sus enlaces; el modelo Slip ponía entonces una pared deslizante EN el
+propio nodo y lo realimentaba (|u| 0.3 → 13 en 16 pasos, independiente de ν; apareció en el borde de salida del flap del
+2022 con la rejilla de 14.4 mm). Ahora los nodos a < 0.1 celdas de la superficie no deslizan (`compute_wall_geometry`).
+
+**Límites conocidos del refinamiento:**
+* Donde una interfaz **corta una pared** (el cuerpo cruza una caja de nivel 2: morro, pontones, soportes), la plantilla
+  trilineal descarta las esquinas sólidas y en paredes no deslizantes la fricción local sale unos % alta (prueba [6]);
+  con el modelo Slip (paredes con ley de pared, la app) descartar es lo apropiado (la velocidad junto a la pared no es 0).
+* Coste: las rejillas finas hacen 2 y 4 subpasos y resuelven casi toda la superficie del coche → la pasada de contorno
+  crece mucho más que las celdas (docs/opt/lbm.md §6).
+* La iGPU no lo admite (docs/GPU.md). Relación 2:1 fija.
+* Las rejillas finas crean alineaciones nuevas de los vóxeles respecto a la geometría: dos nodos patológicos de la física
+  BASE aparecieron así (el nodo con q ≈ 0, ya arreglado arriba, y el borde de salida del ala en efecto suelo a 60 mm con el
+  modelo Slip, §5.0 (*), reproducido en red uniforme y pendiente).
+
 ---------------------------------------------------------------------------------------------------
 
 ## 2. Fuerzas
@@ -295,7 +380,11 @@ con 3.5 celdas, −0.14; F1 2022: −0.16 → −0.01).
 
 Por eso el solver ve el coche **subido** (los dos ejes lo mismo: el rake se conserva):
 
-  h_eff = (h⁴ + g⁴)^¼   con h la menor de las dos alturas pedidas y **g = 3.5·dx**
+  h_eff = (h⁴ + g⁴)^¼   con h la menor de las dos alturas pedidas y **g = 3.5·dx_fondo**
+
+(**dx_fondo** = la dx de la rejilla más fina que contiene el centro del fondo a 2 cm del suelo: con el refinamiento local
+por defecto de los F1, la de la caja "fondo" de nivel 2; sin refinamiento, la de la red. Ver la tabla al final de esta
+sección.)
 
 = g cuando h → 0, 1.19·g cuando h = g y ≈ h en cuanto h ≳ 1.5·g. Es monótona y suave, así que un barrido
 de altura conserva la tendencia (comprimida por debajo de ~g). A Media (dx 35.6 mm) un F1 2022 pedido a
@@ -305,9 +394,23 @@ de altura conserva la tendencia (comprimida por debajo de ~g). A Media (dx 35.6 
 `ride_eff_front_mm/rear_mm`, `ride_gap_min_mm` (= g) y `ride_limited` se muestran en el panel/HUD como
 "altura efectiva (resolución)". Los barridos (`--sweep ride`) usan la altura PEDIDA en el eje x.
 
-Consecuencia: **el efecto suelo de los coches de túneles (1979, 2022+) está muy atenuado** a Media: la
-carga del fondo que se obtiene es la de un coche a 10-15 cm del suelo. Para estudiar alturas reales hace
-falta Ultra (o más) — y aun así las ranuras laterales del fondo quedan en 1-2 celdas.
+Consecuencia (red uniforme): **el efecto suelo de los coches de túneles (1979, 2022+) está muy atenuado** a Media: la
+carga del fondo que se obtiene es la de un coche a 10-15 cm del suelo.
+
+**Con refinamiento local (defecto de los F1, §1.6)** el hueco mínimo baja con la dx de la caja del fondo (F1 2022, pedido
+30/80 mm):
+
+| Preset | Red uniforme: dx → efectiva | Refinada: dx del fondo → efectiva |
+|---|---|---|
+| Rápida | 47.7 mm → 167/217 mm | (1 nivel, defecto) 28.7 mm → ~100/150 mm; con `--refine 2`: 17.4 mm → 62/112 mm |
+| Media | 35.6 mm → **125/175 mm** | 12.8 mm → **47/97 mm** |
+| Alta | 27.5 mm → 97/147 mm | 9.8 mm → **38/88 mm** |
+
+Barrido de altura del F1 2022 a Media refinada (pedida → efectiva → SCz): 10/60 → 45/95 mm → 1.26; 30/80 → 47/97 → 1.40;
+60/110 → 64/114 → 1.20; 120/170 → 121/171 → 1.16 m². Ya son geometrías distintas (antes 10/60 y 30/80 eran la misma) y la
+carga baja al subir el coche, pero las diferencias por debajo de 60 mm (≈ 0.1-0.14 m²) son del orden del ruido de una
+tanda y el fondo plano en sí apenas carga (−0.05 … +0.07 m²): el salto de carga viene del alerón delantero, no del efecto
+suelo del fondo. Las ranuras laterales del fondo y el borde del difusor siguen en pocas celdas.
 
 ---------------------------------------------------------------------------------------------------
 
@@ -363,7 +466,50 @@ Lo que NO se ha podido conseguir (y por qué): las cargas totales de los F1 mode
 (L/D ≈ 1 a Media; 0.36 a Ultra): el límite es la resolución, no la geometría. Agrandar los alerones
 ×3 lo "arreglaría" pero dejaría coches irreconocibles.
 
-### 5.1 Tabla (sim vs referencia)
+### 5.0 Refinamiento local: antes / después (Media, `tools/calib`, 4 PF coches / 5 objetos, media de los 2 últimos)
+
+"Antes" = red uniforme (`--refine 0`) con el árbol actual (reproduce §1.5: F1 2022 0.83 / 2.13 frente a 0.82 / 2.15);
+"después" = 2 niveles finos (`--refine 2`: defecto de los F1; los objetos sólo si se pide). Mismo presupuesto (≈ 6 M celdas
+en total).
+
+| Caso | dx (base → más fina) | Antes | Después | Referencia |
+|---|---|---|---|---|
+| F1 2022 SCz / SCx (m²) | 35.6 → 51.3 / 25.7 / **12.8 mm** | 0.83 / 2.13 (bal. 37 %) | **1.40 / 2.17** (bal. 77 %) | 4.4 / 1.15 |
+| · alerón del. / tras. / beam | | 0.64 / 0.17 / −0.02 | **1.26** / 0.24 / −0.05 | |
+| · fondo / difusor | | 0.13 / 0.37 | 0.07 / 0.36 | |
+| · ruedas del. / tras. (SCz; SCx) | | −0.10; 0.34 / −0.15; 0.61 | −0.03; 0.43 / −0.18; 0.55 | |
+| F1 2022 DRS abierto SCz / SCx | | 0.55 / 2.05 (ΔSCx −0.07, −3 %) | 0.97 / 2.04 (**ΔSCx −0.12, −6 %**) | ΔSCx −10..−25 % |
+| F1 2022 a **Alta** SCz / SCx | 27.5 → 39.2 / 19.6 / 9.8 mm | 0.90 / 2.12 (efectiva 97/147) | **1.40 / 2.06** (efectiva 38/88) | 4.4 / 1.15 |
+| F1 2019 SCz / SCx | 35.8 → 50.7 … 12.7 mm | 0.82 / 2.21 | **1.44 / 2.18** (al. del. 1.32, fondo 0.43) | 5.0 / 1.35 |
+| F1 1967 SCz / SCx | 28.9 → 34.6 / 17.3 mm (sin alerones: 1 nivel) | −0.20 / 1.02 | −0.14 / **0.86** | −0.20 / 0.75 |
+| Ala en efecto suelo, h = 60 mm, CL / CD | 11.3 → 24.3 / 12.1 / 6.1 mm | 1.30 / 0.381 | **diverge** (*) | |
+| Ala en efecto suelo, h = 300 mm, CL / CD | 11.6 → 25.4 / 12.7 / 6.4 mm | 0.98 / 0.288 | 1.36 / 0.288 | |
+| NACA 0012 6°, CL / CD | 23.6 → 42.9 / 21.4 / 10.7 mm | 0.305 / 0.081 | **0.323 / 0.058** | 0.39 (Helmbold), CD₀ ≈ 0.012 + inducida |
+| Esfera CD | 27.6 → 36.1 / 18.0 / 9.0 mm | 0.358 | 0.381 | 0.47 sub / 0.1-0.2 supercrítico |
+| Ahmed 25° CD / CL | 8.6 → 16.4 / 8.2 / 4.1 mm | 0.634 / −0.17 | 0.646 / −0.36 | 0.285 |
+
+(*) Con 2 niveles (6.1 mm) el ala a 60 mm **diverge** en el arranque (la recuperación automática sube ν a 3·10⁻⁴ / 9·10⁻⁴
+y da CL 1.51 o 0.99 según la tanda: no fiable). Diagnóstico: la velocidad crece sin límite (|u| 0.21 → 0.57 → Mach de red
+> 1 en ~200 subpasos) en el nodo justo encima del borde de salida del plano principal, en la ranura del flap. **No es la
+interfaz**: una red UNIFORME con exactamente el mismo origen, dx, dimensiones y ν que la rejilla fina diverge igual, con el
+rebote no deslizante (`--wall none`) es estable y con otra alineación de la misma dx también. Es el modelo de pared Slip en
+esa configuración concreta de vóxeles del borde de salida (la curvatura unilateral no lo marca como arista viva), un límite
+de la física base que el refinamiento sólo destapa al producir esa alineación. Pendiente: acotar la velocidad de
+deslizamiento (p. ej. a ~2 u∞) o detectar mejor las aristas; no se hizo para no cambiar la calibración de §5.1.
+
+Lectura honesta:
+* El cambio grande es el **alerón delantero** de los F1 (×2: 0.64 → 1.26-1.32 m² con 12.8 / 9.8 mm, igual a Media y a
+  Alta): con 3-4 veces más celdas de cuerda funciona como un perfil. La carga total de un F1 moderno pasa de 0.8 a 1.4 m²
+  (de un 19 % a un 32 % de la real) y el DRS quita el doble de resistencia; el balance se va adelante (77-81 %) porque el
+  alerón trasero sigue en una estela lenta (0.24 m², real ~1) y el **fondo casi no carga** aun con 47/97 mm efectivos: el
+  efecto suelo de los túneles Venturi del 2022 no aparece todavía (con 9.8 mm a Alta el fondo da 0.01 m²). SCx apenas cambia
+  (las ruedas dominan).
+* Resolución: Media y Alta refinadas dan lo mismo (1.40 / 1.40): la dx del alerón delantero ya no limita el resultado.
+* Objetos: el NACA 0012 baja la resistencia un 28 % (0.081 → 0.058) y sube algo la sustentación; el ala en efecto suelo a
+  300 mm sube la carga un 39 % (a 60 mm, ver (*)); la esfera y el Ahmed no mejoran (su problema es el desprendimiento sobre
+  superficies lisas a Re alto, no la dx). Los objetos no se refinan por defecto.
+
+### 5.1 Tabla (sim vs referencia, red uniforme)
 
 Medido con `calib` (el mismo `Sim` que la app) el 28-09 con el árbol final: preset **Media**, 4 pasos de flujo
 (coches) o 5 (objetos) desde el arranque impulsivo y **media de los 2 últimos**; cinta móvil y ruedas
@@ -483,6 +629,13 @@ Media 0.27 / 0.30, Alta 0.31 / 0.29, Ultra 0.36 / 0.26; NACA 0012 a 6°: Rápida
 | Esponja | 12 % final en x, ν → 0.12 | — | |
 | Hueco mínimo bajo el fondo | 3.5 celdas | — | `Sim::k_gap_cells` (sección 3) |
 | Precisión | FP16S | `--fp32` | diferencia de Cd 0.3 % |
+| Refinamiento local | F1: 2 niveles (1 en Rápida); resto: 0 | `--refine 0\|1\|2`, `--refine-box` | §1.6; la iGPU sólo con 0 |
+
+Estabilidad con **refinamiento local** (árbol final, 1 PF): Rápida con los defectos (F1 con 1 nivel) 18/18, Rápida con
+`--refine 2` en todos los modelos 18/18, Media con los defectos (F1 con 2 niveles) 18/18 y Media con `--refine 2` 18/18
+(`airfoil_2d` ocupa todo el ancho y queda sin refinar). Fuera de esa prueba (altura por defecto) sí diverge el ala en efecto
+suelo a 60 mm con 2 niveles (dx 6.1 mm): es el modelo Slip en el borde de salida con esa alineación de vóxeles, reproducido
+en una red uniforme sin refinamiento (§5.0 (*)).
 
 Estabilidad: `cfd --stability` recorre los 18 modelos (con `--res` un preset). Con los defectos de arriba:
 18/18 estables en Rápida (1.5 PF), Media (1 PF) y Alta (1 PF); en Ultra se han comprobado f1_2022,

@@ -152,15 +152,30 @@ namespace {
 
 // Envolvente del objeto (m) sobre los extremos de los rangos de la UI: al mover un deslizador el
 // objeto no debe salirse del túnel (el dominio sólo cambia con un reinicio completo).
-Aabb envelope_bounds(int model, const Params& p0, bool ground) {
+// comps (opcional, sdf::Component::Count cajas): envolvente de cada componente sobre las mismas variantes.
+// with_yaw = false: sin las variantes de guiñada (cajas de refinamiento: con ±10° la del alerón delantero de un F1 casi
+// duplicaba su volumen; si luego se gira el coche, lo que salga de una caja fina se simula con la dx de su padre).
+Aabb envelope_bounds(int model, const Params& p0, bool ground, Aabb* comps = nullptr, bool with_yaw = true) {
     const Info& I = models::info(model);
     const ParamRanges R = param_ranges(model);
     const Params base = sanitize_params(model, p0);
     const models::Built b0 = models::build(model, base);
     Aabb box = b0.bounds_m;
-    auto add = [&](Params q) { box.grow(models::build(model, sanitize_params(model, q)).bounds_m); };
+    auto grow_comps = [&](const models::Built& b) {
+        if (!comps) return;
+        for (const auto& g : b.scene.groups()) {
+            const int c = static_cast<int>(g.component);
+            if (c >= 0 && c < static_cast<int>(sdf::Component::Count) && !g.box_model.empty()) comps[c].grow(g.box_model);
+        }
+    };
+    grow_comps(b0);
+    auto add = [&](Params q) {
+        const models::Built b = models::build(model, sanitize_params(model, q));
+        box.grow(b.bounds_m);
+        grow_comps(b);
+    };
     const u32 m = I.param_mask;
-    if (m & models::P_Yaw) { Params q = base; q.yaw_deg = R.yaw.hi; add(q); q.yaw_deg = R.yaw.lo; add(q); }
+    if ((m & models::P_Yaw) && with_yaw) { Params q = base; q.yaw_deg = R.yaw.hi; add(q); q.yaw_deg = R.yaw.lo; add(q); }
     if (m & models::P_Aoa) { Params q = base; q.aoa_deg = R.aoa.hi; add(q); q.aoa_deg = R.aoa.lo; add(q); }
     if ((m & models::P_Height) && ground) { Params q = base; q.height_mm = R.height.hi; add(q); }
     if (m & models::P_RideHeight) {
@@ -278,6 +293,211 @@ DomainPlan plan_domain(int model, const Params& p, bool ground_layout, usize bud
     d.map.dx = dx;
     d.map.origin = Vec3(x0 + 0.5f * dx, y0 + 0.5f * dx, z0 + 0.5f * dx);   // centro de la celda (0,0,0)
     return d;
+}
+
+// ============================================================================
+//  Refinamiento local: cajas finas automáticas y presupuesto
+// ============================================================================
+int default_refine(int model, Preset p) {
+    const Info& I = models::info(model);
+    if (I.kind != models::Kind::F1Car) return 0;
+    return p == Preset::Rapida ? 1 : 2;
+}
+
+namespace {
+float vol(const Aabb& b) { const Vec3 s = b.size(); return max_(s.x, 0.0f) * max_(s.y, 0.0f) * max_(s.z, 0.0f); }
+Aabb pad(const Aabb& b, Vec3 lo, Vec3 hi) { return {b.lo - lo, b.hi + hi}; }
+// Caja pedida (m) → celdas cubiertas [lo, hi] de la rejilla con ese mapa (la celda que contiene cada extremo).
+lbm::LevelBox cells_of(const Aabb& b, const LatticeMap& m, int parent, bool ground) {
+    lbm::LevelBox lb;
+    lb.parent = parent;
+    const Vec3 a = m.to_cells(b.lo), c = m.to_cells(b.hi);
+    const float lo[3] = {a.x, a.y, a.z}, hi[3] = {c.x, c.y, c.z};
+    for (int k = 0; k < 3; ++k) {
+        lb.lo[k] = static_cast<int>(std::floor(lo[k] + 0.5f));
+        lb.hi[k] = static_cast<int>(std::floor(hi[k] + 0.5f));
+    }
+    if (ground) lb.lo[2] = 1;
+    return lb;
+}
+// Mapa de la rejilla fina de una caja normalizada (la celda fina i está en lo − ¾ + ½·i del padre).
+LatticeMap child_map(const LatticeMap& pm, const lbm::LevelBox& b) {
+    LatticeMap m;
+    m.dx = 0.5f * pm.dx;
+    m.origin = pm.to_model(Vec3(static_cast<float>(b.lo[0]) - 0.75f, static_cast<float>(b.lo[1]) - 0.75f, static_cast<float>(b.lo[2]) - 0.75f));
+    return m;
+}
+bool separated(const lbm::LevelBox& a, const lbm::LevelBox& b, int gap) {
+    for (int k = 0; k < 3; ++k)
+        if (a.lo[k] > b.hi[k] + gap || b.lo[k] > a.hi[k] + gap) return true;
+    return false;
+}
+} // namespace
+
+RefinePlan plan_refined(int model, const Params& p, bool ground, usize budget, int refine, const std::vector<ManualBox>* manual) {
+    RefinePlan rp;
+    const Info& I = models::info(model);
+    const Cat cat = category(I);
+    if (refine <= 0 || I.spans_domain) {   // (alas que ocupan todo el ancho: la caja fina no puede tocar las caras)
+        rp.dom = plan_domain(model, p, ground, budget);
+        rp.total_cells = rp.dom.cells();
+        rp.dx_under = rp.dom.dx;
+        return rp;
+    }
+    refine = min_(refine, 2);
+    constexpr int NC = static_cast<int>(sdf::Component::Count);
+    Aabb comp[NC];
+    const Aabb ob = envelope_bounds(model, p, ground, comp, false);
+    const Vec3 sz = ob.size();
+    // ---- Regiones (m) ----
+    struct Want { const char* name; Aabb b; int parent; bool ground; };
+    std::vector<Want> want;
+    const float zg = -1.0f;   // "hasta el suelo" (se fija lo[2] = 1)
+    switch (cat) {
+        case Cat::Car: want.push_back({I.kind == models::Kind::F1Car ? "coche" : "objeto", pad(ob, {0.15f, 0.12f, 0}, {0.45f, 0.12f, 0.20f}), 0, ground}); break;
+        case Cat::WingGround: { const float c = sz.x; want.push_back({"ala", pad(ob, {0.3f * c, 0.12f * c, 0}, {0.8f * c, 0.12f * c, 0.3f * c}), 0, ground}); break; }
+        case Cat::Wing: { const float c = sz.x; want.push_back({"ala", pad(ob, {0.3f * c, 0.15f * c, 0.3f * c}, {1.0f * c, 0.15f * c, 0.3f * c}), 0, false}); break; }
+        case Cat::Body: { const float d = max_(sz.x, sz.z); want.push_back({"objeto", pad(ob, Vec3(0.3f * d), {1.0f * d, 0.3f * d, 0.3f * d}), 0, false}); break; }
+    }
+    if (want[0].ground) want[0].b.lo.z = zg;
+    if (manual && !manual->empty()) {
+        // Cajas manuales: la de nivel 1 (si la hay) sustituye a la automática; las de nivel 2 cuelgan de ella. Una caja que
+        // baja hasta el suelo (z ≤ 0) se apoya en él.
+        for (const ManualBox& mb : *manual)
+            if (mb.depth <= 1) { want[0].b = mb.box_m; want[0].ground = ground && mb.box_m.lo.z <= 0.0f; if (want[0].ground) want[0].b.lo.z = zg; }
+        refine = 1;
+        for (const ManualBox& mb : *manual)
+            if (mb.depth >= 2) {
+                Aabb b = mb.box_m;
+                const bool gb = ground && b.lo.z <= 0.0f && want[0].ground;
+                if (gb) b.lo.z = zg;
+                want.push_back({"manual", b, 1, gb});
+                refine = 2;
+            }
+    } else if (refine >= 2) {
+        auto C = [&](sdf::Component c) -> const Aabb& { return comp[static_cast<int>(c)]; };
+        if (I.kind == models::Kind::F1Car) {
+            const Vec3 m(0.06f);
+            if (!C(sdf::Component::FrontWing).empty()) {
+                Aabb b = pad(C(sdf::Component::FrontWing), m, m);
+                b.lo.z = zg;
+                want.push_back({"alerón delantero", b, 1, ground});
+            }
+            // Bajo el coche: fondo + difusor (o los pontones-ala del 1979), hasta 22 cm sobre el fondo.
+            Aabb fl = C(sdf::Component::Floor);
+            fl.grow(C(sdf::Component::Diffuser));
+            if (fl.empty() && !C(sdf::Component::Sidepods).empty() && C(sdf::Component::Sidepods).lo.z < 0.05f) fl = C(sdf::Component::Sidepods);
+            if (!fl.empty()) {
+                Aabb b = pad(fl, m, m);
+                b.hi.z = min_(b.hi.z, fl.lo.z + 0.22f);
+                b.lo.z = zg;
+                want.push_back({"fondo", b, 1, ground});
+            }
+            Aabb rw = C(sdf::Component::RearWing);
+            rw.grow(C(sdf::Component::BeamWing));
+            if (!rw.empty()) want.push_back({"alerón trasero", pad(rw, m, m), 1, false});
+        } else {
+            const float d = max_(sz.x, max_(sz.y, sz.z));
+            Aabb b = pad(ob, Vec3(0.06f * d), Vec3(0.06f * d));
+            if (want[0].ground) b.lo.z = zg;
+            want.push_back({"objeto (fino)", b, 1, want[0].ground});
+            // El nivel 1 debe contener al 2 con margen (≥ 3 celdas del nivel 1 más la capa fantasma): se agranda si hace falta.
+            Aabb g1 = pad(b, Vec3(0.04f * d), Vec3(0.04f * d));
+            if (want[0].ground) g1.lo.z = zg;
+            want[0].b.grow(g1);
+        }
+    }
+    // ---- Presupuesto: N0 + 8·N1 + 64·N2 (en volumen / dx0³) = budget → dx0. Las cajas se redondean a celdas y llevan
+    // la capa fantasma: +1.5 celdas del padre por cara en la estimación.
+    const DomainPlan probe = plan_domain(model, p, ground, budget);
+    const float V = vol(probe.box_m);
+    float dx0 = probe.dx;
+    for (int it = 0; it < 6; ++it) {
+        double acc = V;
+        for (const Want& w : want) {
+            const int depth = w.parent == 0 ? 1 : 2;
+            const float dp = dx0 / static_cast<float>(1 << (depth - 1));
+            Aabb b = w.b;
+            if (w.ground) b.lo.z = 0.0f;
+            acc += std::pow(8.0, depth) * vol(pad(b, Vec3(1.5f * dp), Vec3(1.5f * dp)));
+        }
+        dx0 = static_cast<float>(std::cbrt(acc / static_cast<double>(max_(budget, usize(4096)))));
+    }
+    rp.dom = plan_domain(model, p, ground, static_cast<usize>(static_cast<double>(V) / (static_cast<double>(dx0) * dx0 * dx0)));
+    // ---- Cajas en celdas (nivel 1 primero: el 2 se expresa en celdas del 1 ya normalizado) ----
+    lbm::Config c;
+    c.nx = rp.dom.nx; c.ny = rp.dom.ny; c.nz = rp.dom.nz;
+    c.ground = ground ? lbm::GroundMode::Moving : lbm::GroundMode::None;
+    c.n_boxes = 1;
+    c.boxes[0] = cells_of(want[0].b, rp.dom.map, 0, want[0].ground);
+    lbm::Solver::normalize_boxes(c);
+    const LatticeMap m1 = child_map(rp.dom.map, c.boxes[0]);
+    std::vector<Want> l2;
+    std::vector<lbm::LevelBox> b2;
+    for (usize i = 1; i < want.size(); ++i) { l2.push_back(want[i]); b2.push_back(cells_of(want[i].b, m1, 1, want[i].ground)); }
+    // Hermanas: separación ≥ 4 celdas del nivel 1. Primero se recorta la tapa del "fondo" bajo la otra caja; si aun así se
+    // tocan, se fusionan (unión).
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (usize i = 0; i < b2.size() && !changed; ++i)
+            for (usize j = i + 1; j < b2.size() && !changed; ++j) {
+                if (separated(b2[i], b2[j], 4)) continue;
+                const usize f = !std::strcmp(l2[i].name, "fondo") ? i : (!std::strcmp(l2[j].name, "fondo") ? j : b2.size());
+                if (f < b2.size()) {
+                    const usize o = f == i ? j : i;
+                    const int top = b2[o].lo[2] - 5;
+                    if (top > b2[f].lo[2] + 3 && b2[f].hi[2] > top) {
+                        b2[f].hi[2] = top;
+                        l2[f].b.hi.z = min_(l2[f].b.hi.z, m1.to_model(Vec3(0, 0, static_cast<float>(top))).z);
+                        changed = true;
+                        continue;
+                    }
+                }
+                for (int k = 0; k < 3; ++k) { b2[i].lo[k] = min_(b2[i].lo[k], b2[j].lo[k]); b2[i].hi[k] = max_(b2[i].hi[k], b2[j].hi[k]); }
+                l2[i].b.grow(l2[j].b);
+                l2[i].name = "fusionada";
+                l2[i].ground = l2[i].ground || l2[j].ground;
+                b2.erase(b2.begin() + static_cast<i64>(j));
+                l2.erase(l2.begin() + static_cast<i64>(j));
+                changed = true;
+            }
+    }
+    c.n_boxes = 1 + static_cast<int>(min_(b2.size(), usize(lbm::k_max_boxes - 1)));
+    for (int i = 1; i < c.n_boxes; ++i) c.boxes[i] = b2[static_cast<usize>(i - 1)];
+    lbm::Solver::normalize_boxes(c);
+    rp.n_boxes = c.n_boxes;
+    rp.total_cells = rp.dom.cells();
+    rp.levels.clear();
+    for (int i = 0; i < c.n_boxes; ++i) {
+        rp.boxes[i] = c.boxes[i];
+        LevelPlan L;
+        const Want& w = i == 0 ? want[0] : l2[static_cast<usize>(i - 1)];
+        L.name = w.name;
+        L.parent = c.boxes[i].parent;
+        L.depth = L.parent == 0 ? 1 : 2;
+        L.box_m = w.b;
+        L.map = child_map(L.parent == 0 ? rp.dom.map : rp.levels[static_cast<usize>(L.parent - 1)].map, c.boxes[i]);
+        L.dx = L.map.dx;
+        L.nx = 2 * (c.boxes[i].hi[0] - c.boxes[i].lo[0] + 1) + 2;
+        L.ny = 2 * (c.boxes[i].hi[1] - c.boxes[i].lo[1] + 1) + 2;
+        L.nz = 2 * (c.boxes[i].hi[2] - c.boxes[i].lo[2] + 1) + 2;
+        L.ground = ground && c.boxes[i].lo[2] == 1 && (L.parent == 0 || rp.levels[static_cast<usize>(L.parent - 1)].ground);
+        L.inner_m = {L.map.to_model(Vec3(0.5f)), L.map.to_model(Vec3(L.nx - 1.5f, L.ny - 1.5f, L.nz - 1.5f))};
+        rp.total_cells += L.cells();
+        rp.levels.push_back(L);
+    }
+    // dx bajo el coche: la rejilla más fina cuya región propia contiene el centro del fondo, 2 cm sobre el suelo.
+    rp.dx_under = rp.dom.dx;
+    if (ground) {
+        Aabb fl = comp[static_cast<int>(sdf::Component::Floor)];
+        const Vec3 q = fl.empty() ? Vec3(ob.center().x, ob.center().y, 0.02f) : Vec3(fl.center().x, fl.center().y, 0.02f);
+        for (const LevelPlan& L : rp.levels)
+            if (q.x >= L.inner_m.lo.x && q.x <= L.inner_m.hi.x && q.y >= L.inner_m.lo.y && q.y <= L.inner_m.hi.y && q.z >= L.inner_m.lo.z &&
+                q.z <= L.inner_m.hi.z)
+                rp.dx_under = min_(rp.dx_under, L.dx);
+    }
+    return rp;
 }
 
 // ============================================================================
@@ -425,7 +645,9 @@ float Sim::re_lattice() const { return cfg.u_lat * (obj_len_m() / dom.dx) / nu; 
 float Sim::re_real() const { return (speed_kmh / 3.6f) * obj_len_m() / k_nu_air; }
 Aabb Sim::object_cells() const { return {to_cells(built.bounds_m.lo), to_cells(built.bounds_m.hi)}; }
 usize Sim::memory_bytes() const {
-    return solver.memory_bytes() + solid.size() + (mesh.pos.size() * 28 + mesh.tri.size() * 4) +
+    usize lv = 0;
+    for (const Buffer<u8>& b : lv_solid) lv += b.size();
+    return solver.memory_bytes() + solid.size() + lv + (mesh.pos.size() * 28 + mesh.tri.size() * 4) +
            (vox_mesh.pos.size() * 28 + vox_mesh.tri.size() * 4);
 }
 
@@ -463,7 +685,8 @@ void Sim::reset_forces() {
 void Sim::update_effective_params() {
     params_eff = params;
     ride_limited = false;
-    ride_gap_min_mm = k_gap_cells * dom.dx * 1000.0f;
+    // Hueco mínimo con la dx MÁS FINA bajo el coche (refinamiento local: la del fondo; si no, la de la red base).
+    ride_gap_min_mm = k_gap_cells * (dx_under > 0.0f ? dx_under : dom.dx) * 1000.0f;
     const Info& I = models::info(cfg.model);
     if ((I.param_mask & models::P_RideHeight) && dom.ground) {
         // h_eff = (h⁴ + g⁴)^{1/4}: = g con h → 0, ≈ h en cuanto h ≳ 1.5 g (1.19 g con h = g). Suave y monótona.
@@ -485,7 +708,12 @@ void Sim::init() {
     cfg.params = params;
     const bool ground = cfg.ground != lbm::GroundMode::None;
     const usize budget = cfg.cells ? cfg.cells : preset_cells(cfg.preset);
-    dom = plan_domain(cfg.model, params, ground, budget);
+    // Refinamiento local: el presupuesto cubre red base + rejillas finas (plan_refined). La iGPU no lo admite.
+    const RefinePlan rp = plan_refined(cfg.model, params, ground, budget, cfg.manual_boxes.empty() ? refine_wanted() : 2, &cfg.manual_boxes);
+    dom = rp.dom;
+    levels = rp.levels;
+    dx_under = rp.dx_under;
+    total_cells = rp.total_cells;
     update_effective_params();
     built = models::build(cfg.model, params_eff);
     if (cfg.nu > 0.0f) nu = cfg.nu;
@@ -512,10 +740,27 @@ void Sim::init() {
     c.force_gauge = true;
     c.force_galilean = true;
     c.bounce = cfg.interp_bb ? lbm::BounceBack::Interpolated : lbm::BounceBack::Implicit;
+    c.n_boxes = rp.n_boxes;
+    for (int i = 0; i < rp.n_boxes; ++i) c.boxes[i] = rp.boxes[i];
     solver.init(c);
     const usize n = dom.cells();
     if (solid.size() != n) solid.resize(n);
     solid.zero();
+    // Rejillas finas: mapas y dimensiones autoritativos del solver (cajas normalizadas).
+    lv_solid.resize(levels.size());
+    for (usize i = 0; i < levels.size(); ++i) {
+        LevelPlan& L = levels[i];
+        const lbm::GridInfo gi = solver.grid_info(static_cast<int>(i) + 1);
+        L.nx = gi.nx; L.ny = gi.ny; L.nz = gi.nz;
+        L.dx = dom.dx * gi.scale;
+        L.map.dx = L.dx;
+        L.map.origin = dom.map.to_model(gi.org);
+        L.ground = gi.ground;
+        L.inner_m = {dom.map.to_model(gi.inner.lo), dom.map.to_model(gi.inner.hi)};
+        if (lv_solid[i].size() != L.cells()) lv_solid[i].resize(L.cells());
+        lv_solid[i].zero();
+        lv_ctx_[i] = LvCtx{this, static_cast<int>(i)};
+    }
     std::memset(motion_on_, 0, sizeof motion_on_);
     ready = true;
     rebuild_geometry(0.5f);
@@ -565,25 +810,56 @@ float sim_wall_sdf(const void* ctx, Vec3 pc) {
 }
 } // namespace
 
+// Ídem en las celdas de una rejilla fina (ctx = Sim::LvCtx): engrosamiento de k_vox_thicken celdas DE ESA rejilla.
+float Sim::level_wall_sdf(const void* ctx, Vec3 pc) {
+    const LvCtx* c = static_cast<const LvCtx*>(ctx);
+    const LevelPlan& L = c->s->levels[static_cast<usize>(c->l)];
+    return c->s->built.scene.eval(L.map.to_model(pc)) / L.dx - k_vox_thicken;
+}
+
+int Sim::refine_levels() const {
+    int d = 0;
+    for (const LevelPlan& L : levels) d = max_(d, L.depth);
+    return d;
+}
+flowvis::MultiField Sim::multi_field() const {
+    flowvis::MultiField m;
+    m.n = min_(solver.grids(), flowvis::MultiField::k_max);
+    for (int g = 0; g < m.n; ++g) {
+        const lbm::GridInfo gi = solver.grid_info(g);
+        flowvis::GridField& G = m.g[g];
+        G.f = solver.grid_field(g);
+        G.org = gi.org;
+        G.scale = gi.scale;
+        G.inner = gi.inner;
+        G.depth = gi.depth;
+        G.ground = gi.ground;
+    }
+    return m;
+}
+
+int Sim::refine_wanted() const { return cfg.refine >= 0 ? cfg.refine : default_refine(cfg.model, cfg.preset); }
+
 // Huella de contacto de las ruedas: las celdas de fluido de las capas z = 1..2 que quedan ENCAJONADAS entre
 // una rueda (encima) y el suelo (debajo, o una celda ya rellenada) pasan a ser de la rueda. Una cuña de 1-2
 // celdas de alto entre el neumático y la cinta no se puede resolver: la cinta y la rueda "bombean" fluido
 // dentro/fuera (medido: Cp +10 / -17 en esas celdas, ρ → 0.13 y divergencia con la ley de pared). Un
 // neumático real se aplana en una huella de ~15-20 cm; con dx de 3-5 cm esto rellena 1-3 celdas por
 // delante y por detrás del contacto. Esas celdas (z ≤ contact_z) se mueven con la cinta.
-usize Sim::fill_contact_pockets() {
-    if (!dom.ground) return 0;
+usize Sim::fill_contact_pockets(u8* solid_ids, int gnx, int gny, int gnz, bool grounded) {
+    if (!grounded) return 0;
+    u8* solid = solid_ids;
     const auto& gs = built.scene.groups();
     bool wheel_id[256] = {};
     bool any = false;
     for (usize g = 0; g < gs.size() && g < 254; ++g)
         if (gs[g].component == sdf::Component::FrontWheels || gs[g].component == sdf::Component::RearWheels) { wheel_id[g + 1] = true; any = true; }
     if (!any) return 0;
-    const usize nx = static_cast<usize>(dom.nx), nxny = nx * static_cast<usize>(dom.ny);
+    const usize nx = static_cast<usize>(gnx), nxny = nx * static_cast<usize>(gny);
     usize filled = 0;
-    for (int z = 1; z <= 2 && z + 1 < dom.nz; ++z)
-        for (int y = 1; y < dom.ny - 1; ++y)
-            for (int x = 1; x < dom.nx - 1; ++x) {
+    for (int z = 1; z <= 2 && z + 1 < gnz; ++z)
+        for (int y = 1; y < gny - 1; ++y)
+            for (int x = 1; x < gnx - 1; ++x) {
                 const usize n = static_cast<usize>(x) + nx * static_cast<usize>(y) + nxny * static_cast<usize>(z);
                 if (solid[n]) continue;
                 const u8 above = solid[n + nxny];
@@ -599,8 +875,18 @@ void Sim::rebuild_geometry(float fraction) {
     vo.thicken = k_vox_thicken;
     vo.supersample = false;
     const geom::VoxelStats vs = geom::voxelize(built.scene, dom.map, dom.nx, dom.ny, dom.nz, solid.data(), vo);
-    solid_cells = vs.solid_cells + fill_contact_pockets();
+    solid_cells = vs.solid_cells + fill_contact_pockets(solid.data(), dom.nx, dom.ny, dom.nz, dom.ground);
+    // Rejillas finas: misma voxelización con su mapa (las flotantes también en su capa z = 0: fantasmas o sólidos).
+    for (usize i = 0; i < levels.size(); ++i) {
+        const LevelPlan& L = levels[i];
+        geom::VoxelOptions vl = vo;
+        vl.z_min = L.ground ? 1 : 0;
+        geom::voxelize(built.scene, L.map, L.nx, L.ny, L.nz, lv_solid[i].data(), vl);
+        fill_contact_pockets(lv_solid[i].data(), L.nx, L.ny, L.nz, L.ground);
+    }
     const double t1 = now_sec();
+    for (usize i = 0; i < levels.size(); ++i)
+        solver.set_grid_geometry(static_cast<int>(i) + 1, lv_solid[i].data(), lbm::WallSdf{&Sim::level_wall_sdf, &lv_ctx_[i]});
     solver.set_geometry(solid.data(), lbm::WallSdf{&sim_wall_sdf, this});
     apply_wall_motions();
     const double t2 = now_sec();
@@ -715,6 +1001,12 @@ bool Sim::set_gpu(bool on) {
         if (gpu) gpu->detach();
         cfg.gpu = false;
         return true;
+    }
+    if (solver.grids() > 1) {
+        gpu_error = "la iGPU no admite el refinamiento local (Refinamiento: 0 para usar la iGPU)";
+        std::fprintf(stderr, "[cfd] %s: el solver sigue en la CPU\n", gpu_error.c_str());
+        cfg.gpu = false;
+        return false;
     }
     if (!gpu) gpu = std::make_unique<gpu::LbmGpu>();
     std::string err;

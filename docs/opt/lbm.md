@@ -238,3 +238,52 @@ capa 3 (paridad a 1e-6 en FP32).
 
 Justificación: sin la corrección el campo que se dibuja y del que salen las fuerzas es ruido (±38 % de u∞ en el túnel
 vacío). La viscosidad de volumen y la capa son gratis; el coste es el término de 3er orden.
+
+---
+
+## 6. Refinamiento local por bloques (`src/lbm/refine.cpp`)
+
+Método y validación física: `docs/FISICA.md` §1.6. Aquí, cómo se ejecuta y qué cuesta.
+
+**Reutilización del kernel.** Cada nivel es otra `Solver::Impl` completa (`solver_impl.hpp`) con el kernel AVX2 de
+siempre: fantasmas, esclavas y cubiertas son "sólidos con id 0" (carriles preservados por mezcla, bloques 100 %
+cubiertos = `kBlkSkip`, filas sin trabajo fuera de `rows_active`), así que el kernel no tiene ni una rama nueva salvo el
+bit `kBlkTap` (abajo). Sin cajas (`n_boxes = 0`) el camino es el de antes: `bench_lbm` 256×128×96 FP16S RR "coche"
+781 MLUPS antes / 795-827 después (dentro del ruido y del estado térmico).
+
+**Trucos de las pasadas de interfaz** (F1 2022 a Media, 4 rejillas finas; ms por paso de la red base, 20 hilos, medidas
+intercaladas en la misma sesión):
+
+| # | Truco | Dónde | Efecto medido |
+|---|---|---|---|
+| R1 | **Medias de las esclavas desde el propio kernel ("taps")**: los bloques de 8 celdas con hijas de esclavas llevan el bit de clase `kBlkTap`; el kernel guarda ahí ρ, u y Π^neq (10 f8 por bloque) que ya calculaba, y la restricción promedia 8 × 10 floats de un búfer compacto en vez de releer 8 × 19 poblaciones. Obliga a ejecutar el kernel de la hija ANTES de la restricción del padre (fase A / fase B de `step_rest`). | `solver.cpp` (`block_vec`, `block_scalar`, `rows_kernel`), `refine.cpp` (`iface_R`, `step_kernel`) | Medias 5.8 → 2.1 ms. En las caras normales a x cada hija arrastraba 19 líneas de caché para 2 valores útiles: la pasada era de ancho de banda (vectorizarla no ganó nada: 5.8 → 5.8). Coste en el kernel: 1 comparación por bloque (predicha). |
+| R2 | **Sólo se escriben las direcciones que alguien lee**: un fantasma de cara escribe las ~5 poblaciones que entran en la rejilla fina (máscara por celda, `IGhost::dmask`), no las 19; ídem las esclavas hacia el padre | `refine.cpp` (`write_post`, `write_post8`, `iface_build`) | Fantasmas + esclavas 5.4 → 3.8 ms (en las caras x: 19 → ~5 líneas de caché por fantasma). |
+| R3 | **Fantasmas y esclavas en AVX2** (8 celdas seguidas de las caras y/z): la plantilla trilineal se mezcla por carril (escalar, 8 entradas) y la reconstrucción + colisión regularizada + escritura usa el `collide<f8>` genérico del kernel con stores FP16 de 8 | `refine.cpp` (`write_post8`, `iface_ghost`, `iface_restrict`) | Resultados idénticos a la ruta escalar; ganancia pequeña por sí sola (la pasada era de memoria) pero necesaria tras R1/R2. |
+| R4 | **Media de las hijas = momentos de la media de sus poblaciones** (lineales): Π^neq de la media incluye la dispersión de velocidades ⟨ρuu⟩ − ρ̄ūū (idéntico a promediar poblaciones) | `refine.cpp` (`iface_R`) | 8× menos aritmética que promediar estados por hija (antes de R1). |
+| R5 | **Plantillas y listas precalculadas** al cambiar la geometría (índices, pesos, esquinas sólidas fuera, grupos de 8) | `refine.cpp` (`iface_build`) | Sin búsquedas por paso; reconstrucción de interfaces 20-40 ms a Media. |
+
+Total de interfaz (medias + esclavas + fantasmas + M): **11.7 → 7.0 ms/paso** de la base a Media.
+
+**Coste por paso de flujo (F1 2022, Media, mismo presupuesto ≈ 6 M celdas):**
+
+| | Red uniforme | Refinada (2 niveles) |
+|---|---|---|
+| Celdas | 6.11 M (dx 35.6 mm) | 5.85 M = 2.08 base (51.3 mm) + 1.41 (25.7) + 2.37 (12.8) |
+| Actualizaciones de celda por paso de la base | 6.1 M | 14.4 M (2 y 4 subpasos) |
+| Pasos de la base por paso de flujo | 1770 | 1228 |
+| Tiempo por paso de la base (kernel / contorno / interfaz) | 8-12 ms (7 / 1 / —) | 35-50 ms (16-23 / 11-18 / 7-10) |
+| MLUPS "equivalentes" (actualizaciones de todas las rejillas / s) | 765-830 | 400-420 (mismo estado térmico) |
+| **Tiempo por paso de flujo** | 1 | **≈ 2.9×** (cociente estable en pares intercalados; los absolutos varían ±50 % con la temperatura del portátil) |
+| `cfd --bench` Media, 4 pasos/cuadro | 64 ms/cuadro (15.7 FPS) | 210 ms/cuadro (4.8 FPS; el bucle interactivo baja los pasos por cuadro para mantener la fluidez) |
+| Visualización por cuadro (muestreo compuesto, cortes, humo, color) | 5.1 ms | 7.4 ms |
+| Reconstrucción geométrica (arrastrar un deslizador) | 75 ms | 277 ms (voxelizar y reconstruir 5 rejillas) |
+
+Lectura: el kernel sí va a ~1000 MLUPS en las rejillas finas; lo que encarece el refinamiento es la **pasada de contorno**
+(rebote interpolado + ley de pared + fuerzas), que escala con la superficie resuelta: las rejillas de 12.8 mm contienen
+casi toda la superficie del coche y hacen 4 subpasos → ~0.75 M nodos de pared por paso de la base frente a ~32 k, y cada
+nodo lee sus 19 poblaciones de 19 líneas distintas (sobre todo en superficies normales a x). Es el siguiente objetivo de
+optimización (p. ej. agrupar nodos por bloque de 8 o fusionar la pasada con el kernel en los bloques de pared).
+
+**Descartado:** acoplamiento volumétrico conservativo (Rohde et al. 2006 / Chen et al. 2006): exacto en masa, pero la
+"explosión" uniforme es de 1.er orden y no reescala el no equilibrio (con τ → ½ es un factor 2 entre niveles); el de
+momentos da Cd de esfera a 0.07 % de la red fina con una deriva de masa medida de 5·10⁻⁶ en el peor caso.

@@ -7,7 +7,7 @@ intercalados, experimentos descartados) está en cada documento de módulo:
 
 | Módulo | Documento | Resultado clave |
 |---|---|---|
-| Solver LBM | [`docs/opt/lbm.md`](opt/lbm.md), [`docs/BENCHMARKS_LBM.md`](BENCHMARKS_LBM.md) | ~1000 MLUPS FP16S (94 % del techo de memoria), ~505 MLUPS FP32; ~800 MLUPS con un F1 y la pasada de pared de la fase 2 |
+| Solver LBM | [`docs/opt/lbm.md`](opt/lbm.md), [`docs/BENCHMARKS_LBM.md`](BENCHMARKS_LBM.md) | ~1000 MLUPS FP16S (94 % del techo de memoria), ~505 MLUPS FP32; ~800 MLUPS con un F1 y la pasada de pared de la fase 2; refinamiento local: taps en el kernel, escrituras sólo de las direcciones leídas y fantasmas AVX2 (§6: interfaz 11.7 → 7 ms/paso a Media) |
 | Voxelizador y malladores | [`docs/opt/geom.md`](opt/geom.md) | coche F1 voxelizado en ~6 ms y mallado (333 k triángulos) en ~20 ms con 20 hilos |
 | Modelos | [`docs/opt/models.md`](opt/models.md) | `build` de un coche en 0.06-0.25 ms; eval del SDF −20 % |
 | Rasterizador | [`docs/opt/raster.md`](opt/raster.md) | 300 k triángulos en 2.2 ms a 1500×1150 |

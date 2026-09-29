@@ -78,6 +78,29 @@ Nota para app/voxelizador: los ids de sólido que caigan en las 6 caras se ignor
 - Only the ASan-affordable subset was run under sanitizers. Tests 5, 6 and 7 (big domains) ran only in the optimised build.
 - Line references in docs/opt/lbm.md match the current solver.cpp. They will shift if the file is edited again.
 
+### Refinamiento local por bloques (fase 4, compatible)
+* `lbm::Config::n_boxes` / `boxes[k_max_boxes=8]` (`lbm::LevelBox {parent, lo[3], hi[3]}`: celdas del PADRE cubiertas,
+  inclusive; padres antes que hijas; con suelo `lo[2] ≤ 1` → apoyada). `Solver::normalize_boxes(Config&)` aplica las
+  mismas reglas que `init` (márgenes ≥ 3, `2(hi−lo+1)+2` múltiplo de 8, hermanas separadas ≥ 3 celdas).
+* `grids()`, `grid_info(g)` (`GridInfo`: dims, padre, nivel, `scale` = dx/dx_base, `org` = celda (0,0,0) en celdas de la
+  base, `ground`, `box`, `inner` = región propia en celdas de la base), `set_grid_geometry(g, solid, sdf)` (g = 0 ≡
+  `set_geometry`), `grid_field(g)` (capa fantasma con valores interpolados y flags de fluido; celdas cubiertas con la
+  media de las finas), `last_iface_seconds()`.
+* Semántica con cajas: `step(n)` = n pasos de la base (2^nivel subpasos por rejilla); `forces*()` suman todas las rejillas
+  en unidades de la base (×scale², momentos ×scale³; cada enlace de pared cuenta en una sola rejilla); `field()` =
+  base compuesta; `total_mass()` con volúmenes; `last_mlups()` = actualizaciones de celda de todas las rejillas por
+  segundo; `set_wall_motion`/`set_moment_reference`/`set_inflow`/`set_viscosity`/`set_wall_model` se dan en unidades
+  de la base y el solver los pasa a cada rejilla. `Solver::Impl` es ahora un nombre público opaco (lbm/solver_impl.hpp).
+* iGPU: `LbmGpu::attach` devuelve false con refinamiento (mensaje en `err`).
+* flowvis: `GridField`, `MultiField` (`finest(p)`), `single_field`, `quantity_grid_scale`, `sample_quantity/probe(MultiField)`,
+  `MultiSampler` (misma interfaz que `FlowSampler` para `Streamlines::compute` y `Particles::step`), `SliceView::update(
+  MultiField, ground_layers)` + `texels_per_cell()`, `GroundFootprint::update(MultiField)`, `VortexVolume::update(
+  MultiField)`, `color_mesh(Mesh, MultiField, …)` (offset en celdas de la rejilla más fina). Sin asignaciones por cuadro
+  (búferes que sólo crecen).
+* app: `SimConfig::refine` (−1 auto = `default_refine`), `manual_boxes` (`--refine-box`), `plan_refined()`, `Sim::levels`
+  (`LevelPlan`), `dx_under` (fija `ride_gap_min_mm`), `total_cells`, `multi_field()`; CLI `--refine 0|1|2`,
+  `--refine-box`, vis `boxes`; herramienta `tools/calib.cpp`.
+
 ## geom
 
 ### API (revisor)

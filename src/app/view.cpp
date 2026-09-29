@@ -294,7 +294,8 @@ void View::update(Sim& sim, int steps_advanced) {
         for (int i = 0; i < 256; ++i) group_colors[i] = 0xFFB8BCC4u;
         for (usize g = 0; g < gs.size() && g < 254; ++g) group_colors[g + 1] = render::component_color(gs[g].component);
     }
-    const lbm::FieldView f = sim.solver.field();
+    // Campo compuesto (refinamiento local: la rejilla más fina en cada punto; sin él, la red base sola).
+    const flowvis::MultiField mf = sim.multi_field();
     const bool recompute = field_new || dirty || geom_new || domain_new;
     const float cp_off = cp_offset(sim);   // Cp respecto a la presión de referencia del túnel
     const bool ground = sim.cfg.ground != lbm::GroundMode::None;
@@ -306,7 +307,7 @@ void View::update(Sim& sim, int steps_advanced) {
     const bool need_sampler = vs.lines || vs.smoke;
     if (need_sampler && (field_new || domain_new || !sampler.ready())) {
         const double a = now_sec();
-        sampler.update(f);
+        sampler.update(mf);
         t_upd_sampler = (now_sec() - a) * 1e3;
     }
     // Plano de corte.
@@ -335,7 +336,7 @@ void View::update(Sim& sim, int steps_advanced) {
         // se lee como parte del cuerpo; transparente dejaba ver el fondo por la escalera), gris
         // oscuro si la superficie está oculta (silueta que resuelve el solver).
         slice.params.solid_color = vs.surf == SurfMode::Hidden ? 0xFF2E2F33u : 0xFF7C828Cu;
-        slice.update(f);
+        slice.update(mf);
         t_upd_slice = (now_sec() - a) * 1e3;
     }
     // Huella en el suelo.
@@ -343,7 +344,7 @@ void View::update(Sim& sim, int steps_advanced) {
         footprint.params.quantity = Quantity::Cp;
         footprint.params.scale = {render::Colormap::CoolWarm, -2.0f, 1.0f, true, cp_off};
         footprint.params.auto_range = false;
-        footprint.update(f);
+        footprint.update(mf);
     }
     // Líneas de corriente.
     if (vs.lines) {
@@ -414,7 +415,7 @@ void View::update(Sim& sim, int steps_advanced) {
         vortex.params.field = flowvis::VolumeField::QCriterion;
         vortex.params.color_by = flowvis::VolumeColor::Streamwise;
         vortex.params.downsample = sim.dom.cells() > 9'000'000 ? 2 : (sim.dom.cells() > 3'500'000 ? 2 : 1);
-        vortex.update(f);
+        vortex.update(mf);
         t_upd_vortex = (now_sec() - a) * 1e3;
     }
     vortex.params.style = vs.vortex_cloud ? flowvis::VolumeStyle::Cloud : flowvis::VolumeStyle::Surface;
@@ -441,7 +442,7 @@ void View::update(Sim& sim, int steps_advanced) {
                 case SurfMode::Component: sp.mode = flowvis::SurfaceMode::Component; break;
                 default: sp.mode = flowvis::SurfaceMode::Solid; sp.solid_color = 0xFFB8BCC4u; break;
             }
-            flowvis::color_mesh(m, f, sp);
+            flowvis::color_mesh(m, mf, sp);
             surf_colored = sm;
         }
         t_upd_color = (now_sec() - a) * 1e3;
@@ -506,6 +507,11 @@ void View::render(render::Framebuffer& fb, Rect vp, Sim& sim) {
     const double t3 = now_sec();
     // Túnel y flechas de fuerza.
     if (vs.wire) render::draw_box_wire(fb, cam, dom_cells, 0x46A0B4D0u, 1.0f);
+    if (vs.level_boxes)   // refinamiento local: región propia de cada rejilla fina (celdas de la base)
+        for (int g = 1; g < sim.solver.grids(); ++g) {
+            const lbm::GridInfo gi = sim.solver.grid_info(g);
+            render::draw_box_wire(fb, cam, gi.inner, gi.depth == 1 ? 0xE040D0F0u : 0xE0F0B040u, 1.5f);
+        }
     if (vs.arrows && sim.res.valid) {
         const Aabb ob = sim.object_cells();
         const Vec3 sz = ob.size();
@@ -577,7 +583,7 @@ void View::pick_probe(const render::Framebuffer& fb, Sim& sim, int mx, int my) {
     probe_ok = false;
     probe_on_slice = false;
     if (!vs.probe || !sim.ready || !cam.vp.contains(mx, my)) return;
-    const lbm::FieldView f = sim.solver.field();
+    const flowvis::MultiField f = sim.multi_field();   // la rejilla más fina en el punto
     Vec3 hit;
     float val = 0;
     const float sx = static_cast<float>(mx) + 0.5f, sy = static_cast<float>(my) + 0.5f;

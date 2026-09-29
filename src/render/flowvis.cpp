@@ -579,17 +579,31 @@ void SliceView::update(const FieldView& f) {
     lw_ = S ? tw * S : tw; lh_ = S ? th * S : th;
     if (tex_.size() < static_cast<usize>(lw_) * static_cast<usize>(lh_)) tex_.resize(static_cast<usize>(lw_) * static_cast<usize>(lh_));
     pos_ = clamp_(params.pos == params.pos ? params.pos : 0.0f, 0.0f, static_cast<float>(n_axis_ - 1));   // NaN → 0
+    res_ = 1.0f;
     int k0 = static_cast<int>(pos_);
     float t = pos_ - static_cast<float>(k0);
     if (k0 >= n_axis_ - 1) { k0 = n_axis_ - 1; t = 0.0f; }
     const int k1 = min_(k0 + 1, n_axis_ - 1);
+    plane_values(f, ax, pos_, params.quantity, vals_.data(), tw, th);
+    compute_range();
+    if (S) { build_lic(f, k0, k1, t); return; }
+    colorize();
+}
+
+// Valores del plano eje = pos (celdas de f) de la magnitud q en out (tw×th, NaN en sólidos).
+void SliceView::plane_values(const FieldView& f, Axis ax, float pos, Quantity q, float* vals, int tw, int th) {
+    const int n_axis = ax == Axis::X ? f.nx : (ax == Axis::Y ? f.ny : f.nz);
+    pos = clamp_(pos == pos ? pos : 0.0f, 0.0f, static_cast<float>(n_axis - 1));
+    int k0 = static_cast<int>(pos);
+    float t = pos - static_cast<float>(k0);
+    if (k0 >= n_axis - 1) { k0 = n_axis - 1; t = 0.0f; }
+    const int k1 = min_(k0 + 1, n_axis - 1);
     const bool two = t > 1e-3f;
     const int ks = t < 0.5f ? k0 : k1;   // capa más cercana: decide sólido
 
     const int nthr = max_(pool().size(), 1);
     const usize spad = (static_cast<usize>(tw) + 15) & ~usize{15};
     if (scratch_.size() < spad * static_cast<usize>(nthr)) scratch_.resize(spad * static_cast<usize>(nthr));
-    const Quantity q = params.quantity;
     const Norm k(f.u_inf);
     const CellFn cfn = k_cell_fn[static_cast<int>(q)];
 
@@ -598,7 +612,7 @@ void SliceView::update(const FieldView& f) {
         float* CFD_RESTRICT tmp = scratch_.data() + spad * static_cast<usize>(wi);
         for (i64 vv = lo; vv < hi; ++vv) {
             const int v = static_cast<int>(vv);
-            float* CFD_RESTRICT out = vals_.data() + static_cast<usize>(v) * static_cast<usize>(tw);
+            float* CFD_RESTRICT out = vals + static_cast<usize>(v) * static_cast<usize>(tw);
             if (ax == Axis::X) {
                 const int z = v;
                 for (int y = 0; y < tw; ++y) {
@@ -641,6 +655,11 @@ void SliceView::update(const FieldView& f) {
         }
     });
 
+}
+
+// Rango (robusto o fijo) sobre vals_ (tw_×th_) → eff_, vmin_, vmax_.
+void SliceView::compute_range() {
+    const int tw = tw_, th = th_;
     // Rango (robusto o fijo) + extremos reales (sólo valores finitos). Una pasada de mín/máx
     // y el histograma sólo si hay rango automático (antes: 2 pasadas + 2 histogramas).
     const usize n = static_cast<usize>(tw) * static_cast<usize>(th);
@@ -660,8 +679,11 @@ void SliceView::update(const FieldView& f) {
     }
     if (!(eff_.hi > eff_.lo)) eff_.hi = eff_.lo + max_(1e-3f, std::fabs(eff_.lo) * 1e-3f);
 
-    if (S) { build_lic(f, k0, k1, t); return; }
+}
 
+// Textura de color de vals_ (sin LIC).
+void SliceView::colorize() {
+    const int tw = tw_, th = th_;
     // Pasada de color: 8 texeles por iteración (VPGATHERDD sobre la LUT) + sólidos + desvanecido.
     const ColorScale sc = eff_;
     const u32 solid = params.solid_color;
@@ -710,19 +732,10 @@ void SliceView::update(const FieldView& f) {
 //  (z-score) modula el brillo del color de la magnitud → vetas alineadas con el flujo.
 // ---------------------------------------------------------------------------
 void SliceView::build_lic(const FieldView& f, int k0, int k1, float t) {
-    const int S = clamp_(params.lic, 1, 6);
-    const int tw = tw_, th = th_, lw = lw_, lh = lh_;
+    const int tw = tw_, th = th_;
     const Axis ax = axis_;
     const usize ncell = static_cast<usize>(tw) * static_cast<usize>(th);
-    const usize nsub = static_cast<usize>(lw) * static_cast<usize>(lh);
     if (vel2_.size() < 2 * ncell) vel2_.resize(2 * ncell);
-    if (lic_.size() < nsub) lic_.resize(nsub);
-    if (noise_w_ != lw || noise_h_ != lh) {   // ruido fijo (semilla constante): no parpadea entre cuadros
-        noise_.resize(nsub + 8);                 // +8: el gather de 32 bits lee hasta 3 bytes de más
-        WyRand rng(0x11C0FFEEull);
-        for (usize i = 0; i < nsub + 8; ++i) noise_[i] = static_cast<u8>(rng.next() >> 56);
-        noise_w_ = lw; noise_h_ = lh;
-    }
     // 1. Dirección de la velocidad en el plano por celda (interpolada entre capas); sólido → 0.
     float* CFD_RESTRICT V2 = vel2_.data();
     parallel_for(0, th, 8, [&](i64 lo, i64 hi) {
@@ -746,6 +759,22 @@ void SliceView::build_lic(const FieldView& f, int k0, int k1, float t) {
             }
         }
     });
+    lic_convolve();
+}
+
+// Convolución LIC + color sobre vel2_ (dirección unitaria por texel) y vals_ (tw_×th_ texeles; lw_×lh_ subtexeles).
+void SliceView::lic_convolve() {
+    const int S = clamp_(params.lic, 1, 6);
+    const int tw = tw_, th = th_, lw = lw_, lh = lh_;
+    const usize nsub = static_cast<usize>(lw) * static_cast<usize>(lh);
+    if (lic_.size() < nsub) lic_.resize(nsub);
+    if (noise_w_ != lw || noise_h_ != lh) {   // ruido fijo (semilla constante): no parpadea entre cuadros
+        noise_.resize(nsub + 8);
+        WyRand rng(0x11C0FFEEull);
+        for (usize i = 0; i < nsub + 8; ++i) noise_[i] = static_cast<u8>(rng.next() >> 56);
+        noise_w_ = lw; noise_h_ = lh;
+    }
+    const float* CFD_RESTRICT V2 = vel2_.data();
     // 2. Convolución a lo largo de las líneas de corriente del plano.
     const float h = 1.0f / static_cast<float>(S);                      // paso = 1 subtexel (en celdas)
     const float fS = static_cast<float>(S);
@@ -848,7 +877,7 @@ void SliceView::build_lic(const FieldView& f, int k0, int k1, float t) {
             for (int i = 0; i < lw; ++i) {
                 const float lv = out[static_cast<usize>(j) * static_cast<usize>(lw) + static_cast<usize>(i)];
                 if (lv != lv) { o[i] = solid; continue; }
-                const float val = value_at((static_cast<float>(i) + 0.5f) * h - 0.5f, (static_cast<float>(j) + 0.5f) * h - 0.5f);
+                const float val = value_tex((static_cast<float>(i) + 0.5f) * h - 0.5f, (static_cast<float>(j) + 0.5f) * h - 0.5f);
                 u32 c = map_color(sc, val);
                 const float m = 1.0f + gain * clamp_((lv - fm) * fis, -2.0f, 2.0f);
                 const u32 r = min_(static_cast<u32>(static_cast<float>((c >> 16) & 255) * m), 255u);
@@ -867,6 +896,11 @@ void SliceView::build_lic(const FieldView& f, int k0, int k1, float t) {
 }
 
 float SliceView::value_at(float u, float v) const {
+    // (u, v) en celdas de la base → texeles (con refinamiento hay res_ texeles por celda).
+    return value_tex((u + 0.5f) * res_ - 0.5f, (v + 0.5f) * res_ - 0.5f);
+}
+
+float SliceView::value_tex(float u, float v) const {
     if (vals_.empty()) return k_nan;
     if (!(u >= -0.5f && v >= -0.5f && u <= static_cast<float>(tw_) - 0.5f && v <= static_cast<float>(th_) - 0.5f)) return k_nan;
     const float fu = clamp_(u, 0.0f, static_cast<float>(tw_ - 1)), fv = clamp_(v, 0.0f, static_cast<float>(th_ - 1));
@@ -896,7 +930,7 @@ TranslucentPlane SliceView::translucent_plane() const {
     const bool opaque = params.opacity >= 0.999f && fade_ <= 0.0f;
     t.opacity = (tex_.empty() || opaque) ? 0.0f : clamp_(params.opacity, 0.0f, 1.0f);
     t.lo = {-0.5f, -0.5f};
-    t.hi = {static_cast<float>(tw_) - 0.5f, static_cast<float>(th_) - 0.5f};
+    t.hi = {static_cast<float>(tw_) / res_ - 0.5f, static_cast<float>(th_) / res_ - 0.5f};
     return t;
 }
 
@@ -940,9 +974,148 @@ bool SliceView::pick(const Camera& cam, float sx, float sy, Vec3& hit, float& va
     return true;
 }
 
+// ---------------------------------------------------------------------------
+//  Refinamiento local: plano compuesto. Cada rejilla que corta el plano calcula sus valores con su propia resolución
+//  (plane_values, en sus celdas); la textura final (res_ texeles por celda de la base) toma en cada texel la rejilla
+//  más fina cuya región propia lo contiene (bilineal con pesos de fluido: NaN = sólido).
+// ---------------------------------------------------------------------------
+void SliceView::update(const MultiField& m, bool ground_layers) {
+    const FieldView& f = m.base();
+    if (m.n <= 1) { update(f); return; }
+    CFD_CHECK(f.valid() && f.flags != nullptr, "SliceView: campo sin datos o sin flags");
+    nx_ = f.nx; ny_ = f.ny; nz_ = f.nz;
+    const Axis ax = params.axis;
+    axis_ = ax;
+    fade_ = params.fade_below;
+    n_axis_ = ax == Axis::X ? nx_ : (ax == Axis::Y ? ny_ : nz_);
+    const int a = static_cast<int>(ax), ua = a == 0 ? 1 : 0, va = a == 2 ? 1 : 2;   // ejes del plano (u, v)
+    pos_ = clamp_(params.pos == params.pos ? params.pos : 0.0f, 0.0f, static_cast<float>(n_axis_ - 1));
+    const Quantity q = params.quantity;
+    // Rejillas que cortan el plano y sus valores.
+    int use[MultiField::k_max];
+    int nuse = 0, depth_max = 0;
+    int gw[MultiField::k_max] = {}, gh[MultiField::k_max] = {};
+    for (int g = 0; g < m.n; ++g) {
+        const GridField& G = m.g[g];
+        const int gn[3] = {G.f.nx, G.f.ny, G.f.nz};
+        float pg;
+        if (ground_layers && g > 0) {
+            if (!G.ground) continue;
+            pg = 1.0f;                                       // primera capa de fluido de esta rejilla
+        } else {
+            pg = (pos_ - G.org[a]) / G.scale;
+            if (g > 0 && (pg < 0.5f || pg > static_cast<float>(gn[a]) - 1.5f)) continue;   // el plano no cruza su región propia
+        }
+        const int w = gn[ua], h = gn[va];
+        if (gbuf_[g].size() < static_cast<usize>(w) * static_cast<usize>(h)) gbuf_[g].resize(static_cast<usize>(w) * static_cast<usize>(h));
+        plane_values(G.f, ax, pg, q, gbuf_[g].data(), w, h);
+        const float ks = quantity_grid_scale(q, G.scale);
+        if (ks != 1.0f) {
+            float* b = gbuf_[g].data();
+            for (usize i = 0; i < static_cast<usize>(w) * static_cast<usize>(h); ++i) b[i] *= ks;
+        }
+        gw[g] = w; gh[g] = h;
+        use[nuse++] = g;
+        depth_max = max_(depth_max, G.depth);
+    }
+    // Resolución de la textura: la de la rejilla más fina que corta el plano, hasta ~4 M texeles.
+    const int tw0 = ax == Axis::X ? ny_ : nx_, th0 = ax == Axis::Z ? ny_ : nz_;
+    int r = 1 << depth_max;
+    while (r > 1 && static_cast<double>(tw0) * r * th0 * r > 4.0e6) r >>= 1;
+    res_ = static_cast<float>(r);
+    const int tw = tw0 * r, th = th0 * r;
+    const int S = params.lic > 0 ? clamp_(params.lic, 1, 6) : 0;
+    if (tw != tw_ || th != th_) { tw_ = tw; th_ = th; vals_.resize(static_cast<usize>(tw) * static_cast<usize>(th)); }
+    lw_ = S ? tw * S : tw; lh_ = S ? th * S : th;
+    if (tex_.size() < static_cast<usize>(lw_) * static_cast<usize>(lh_)) tex_.resize(static_cast<usize>(lw_) * static_cast<usize>(lh_));
+    const float ir = 1.0f / static_cast<float>(r);
+    const float zg = ground_layers ? 0.75f : pos_;          // coordenada normal al plano para elegir la rejilla más fina
+    if (S && vel2_.size() < 2 * static_cast<usize>(tw) * static_cast<usize>(th)) vel2_.resize(2 * static_cast<usize>(tw) * static_cast<usize>(th));
+    float* CFD_RESTRICT V2 = S ? vel2_.data() : nullptr;
+    parallel_for(0, th, 4, [&](i64 lo, i64 hi) {
+        for (i64 vv = lo; vv < hi; ++vv) {
+            const int v = static_cast<int>(vv);
+            float* out = vals_.data() + static_cast<usize>(v) * static_cast<usize>(tw);
+            const float pv = (static_cast<float>(v) + 0.5f) * ir - 0.5f;
+            for (int u = 0; u < tw; ++u) {
+                const float pu = (static_cast<float>(u) + 0.5f) * ir - 0.5f;
+                Vec3 p;
+                p[a] = zg; p[ua] = pu; p[va] = pv;
+                // Rejilla más fina (entre las que cortan el plano) que contiene el texel.
+                int g = 0, bd = -1;
+                for (int k = 0; k < nuse; ++k) {
+                    const GridField& G = m.g[use[k]];
+                    if (G.depth <= bd) continue;
+                    if (use[k] == 0 || (p.x >= G.inner.lo.x && p.x <= G.inner.hi.x && p.y >= G.inner.lo.y && p.y <= G.inner.hi.y &&
+                                        (ground_layers ? p.z <= G.inner.hi.z : (p.z >= G.inner.lo.z && p.z <= G.inner.hi.z)))) {
+                        g = use[k];
+                        bd = G.depth;
+                    }
+                }
+                const GridField& G = m.g[g];
+                const float gu = (pu - G.org[ua]) / G.scale, gv = (pv - G.org[va]) / G.scale;
+                const int w = gw[g], h = gh[g];
+                const float fu = clamp_(gu, 0.0f, below_last(w)), fvv = clamp_(gv, 0.0f, below_last(h));
+                const int u0 = static_cast<int>(fu), v0 = static_cast<int>(fvv);
+                const float tu = fu - static_cast<float>(u0), tv = fvv - static_cast<float>(v0);
+                const float* b = gbuf_[g].data();
+                const float c[4] = {b[static_cast<usize>(v0) * w + u0], b[static_cast<usize>(v0) * w + u0 + 1], b[static_cast<usize>(v0 + 1) * w + u0],
+                                    b[static_cast<usize>(v0 + 1) * w + u0 + 1]};
+                const float wt[4] = {(1 - tu) * (1 - tv), tu * (1 - tv), (1 - tu) * tv, tu * tv};
+                float acc = 0.0f, ws = 0.0f;
+                for (int k = 0; k < 4; ++k) if (c[k] == c[k]) { acc += wt[k] * c[k]; ws += wt[k]; }
+                // Sólido si la celda más cercana lo es (como el plano de una sola rejilla).
+                const int kn = (tu < 0.5f ? 0 : 1) + (tv < 0.5f ? 0 : 2);
+                const float val = (c[kn] != c[kn] || ws <= 1e-6f) ? k_nan : acc / ws;
+                out[u] = val;
+                if (V2) {
+                    Vec3 vel{0, 0, 0};
+                    if (val == val) {
+                        Vec3 pp;
+                        pp[a] = ground_layers && g > 0 ? 1.0f : (pos_ - G.org[a]) / G.scale;
+                        if (ground_layers && g == 0) pp[a] = pos_;
+                        pp[ua] = gu; pp[va] = gv;
+                        vel = G.f.velocity(pp);
+                    }
+                    const float cu = vel[ua], cv = vel[va];
+                    const float l2 = cu * cu + cv * cv;
+                    const float inv = l2 < 1e-14f ? 0.0f : 1.0f / std::sqrt(l2);
+                    const usize o = 2 * (static_cast<usize>(v) * static_cast<usize>(tw) + static_cast<usize>(u));
+                    V2[o] = cu * inv;
+                    V2[o + 1] = cv * inv;
+                }
+            }
+        }
+    });
+    compute_range();
+    if (S) { lic_convolve(); return; }
+    colorize();
+}
+
 // ============================================================================
 //  Huella en el suelo
 // ============================================================================
+void GroundFootprint::update(const MultiField& m) {
+    if (m.n <= 1) { update(m.base()); return; }
+    const FieldView& f = m.base();
+    nx_ = f.nx; ny_ = f.ny;
+    float z = params.z;
+    if (z < 0.0f) {
+        const usize n = f.index(f.nx / 2, f.ny / 2, 0);
+        const bool ground = (f.flags[n] & lbm::kSolid) && (!f.solid_id || f.solid_id[n] == lbm::k_ground_id);
+        z = ground ? 1.0f : 0.0f;
+    }
+    slice_.params.axis = Axis::Z;
+    slice_.params.pos = z;
+    slice_.params.quantity = params.quantity;
+    slice_.params.scale = params.scale;
+    slice_.params.auto_range = params.auto_range;
+    slice_.params.opacity = 1.0f;
+    slice_.params.fade_below = 0.0f;
+    slice_.params.lic = 0;
+    slice_.update(m, z >= 1.0f);   // con suelo: la primera capa de fluido de cada rejilla apoyada en él
+}
+
 void GroundFootprint::update(const FieldView& f) {
     nx_ = f.nx; ny_ = f.ny;
     float z = params.z;
@@ -1016,6 +1189,51 @@ WakeStats wake_survey(const FieldView& f, float x_cells) {
 }
 
 // ============================================================================
+//  Refinamiento local: utilidades del campo compuesto
+// ============================================================================
+MultiField single_field(const FieldView& f) {
+    MultiField m;
+    m.n = 1;
+    m.g[0].f = f;
+    m.g[0].inner = {{-0.5f, -0.5f, -0.5f}, {static_cast<float>(f.nx) - 0.5f, static_cast<float>(f.ny) - 0.5f, static_cast<float>(f.nz) - 0.5f}};
+    return m;
+}
+
+float quantity_grid_scale(Quantity q, float scale) {
+    if (q == Quantity::Vorticity) return 1.0f / scale;
+    if (q == Quantity::QCriterion) return 1.0f / (scale * scale);
+    return 1.0f;
+}
+
+float sample_quantity(const MultiField& m, Quantity q, Vec3 p) {
+    const int g = m.finest(p);
+    const GridField& G = m.g[g];
+    return g ? sample_quantity(G.f, q, G.to_grid(p)) * quantity_grid_scale(q, G.scale) : sample_quantity(G.f, q, p);
+}
+
+Probe probe(const MultiField& m, Vec3 p) {
+    const int g = m.finest(p);
+    if (!g) return probe(m.base(), p);
+    const GridField& G = m.g[g];
+    Probe r = probe(G.f, G.to_grid(p));
+    r.pos = p;
+    r.vorticity *= quantity_grid_scale(Quantity::Vorticity, G.scale);
+    r.q *= quantity_grid_scale(Quantity::QCriterion, G.scale);
+    return r;
+}
+
+void MultiSampler::update(const MultiField& m) {
+    n_ = max_(min_(m.n, MultiField::k_max), 0);
+    for (int i = 0; i < n_; ++i) {
+        s_[i].update(m.g[i].f);
+        g_[i] = m.g[i];
+        org_[i][0] = m.g[i].org.x; org_[i][1] = m.g[i].org.y; org_[i][2] = m.g[i].org.z; org_[i][3] = 0.0f;
+        inv_[i] = 1.0f / m.g[i].scale;
+    }
+    nx = s_[0].nx; ny = s_[0].ny; nz = s_[0].nz; u_inf = s_[0].u_inf;
+}
+
+// ============================================================================
 //  Colores de malla
 // ============================================================================
 void color_mesh(Mesh& mesh, const FieldView& f, const SurfaceParams& p) {
@@ -1061,6 +1279,38 @@ void color_mesh(Mesh& mesh, const FieldView& f, const SurfaceParams& p) {
                 Vec3 u;
                 float rho;
                 if (sample_prims(f, q, u, rho)) v = cp ? (rho - 1.0f) * k.cp_k : length(u) * k.inv_u;
+            }
+            col[i] = v == v ? map_color(sc, v) : k_unknown;
+        }
+    });
+}
+
+// Refinamiento local: cada vértice en la rejilla más fina que lo contiene, a `offset` celdas DE ESA rejilla (junto a un
+// alerón de la rejilla fina, a 1 celda fina de la pared y no a 1 celda de la base: la succión se ve donde está).
+void color_mesh(Mesh& mesh, const MultiField& m, const SurfaceParams& p) {
+    if (m.n <= 1 || (p.mode != SurfaceMode::Cp && p.mode != SurfaceMode::Speed)) { color_mesh(mesh, m.base(), p); return; }
+    const usize nv = mesh.pos.size();
+    if (mesh.color.size() != nv) mesh.color.resize(nv);
+    if (nv == 0) return;
+    u32* CFD_RESTRICT col = mesh.color.data();
+    const Vec3* pos = mesh.pos.data();
+    const Vec3* nrm = mesh.nrm.size() == nv ? mesh.nrm.data() : nullptr;
+    const Norm k(m.base().u_inf);
+    const bool cp = p.mode == SurfaceMode::Cp;
+    const ColorScale sc = p.scale;
+    const float off = p.offset;
+    constexpr u32 k_unknown = 0xFF8A8D93u;
+    parallel_for(0, static_cast<i64>(nv), 2048, [&](i64 lo, i64 hi) {
+        for (i64 i = lo; i < hi; ++i) {
+            const Vec3 n = nrm ? nrm[i] : Vec3{0, 0, 0};
+            const int g = m.finest(pos[i]);
+            const GridField& G = m.g[g];
+            float v = k_nan;
+            for (int tries = 0; tries < 2 && v != v; ++tries) {
+                const Vec3 qb = pos[i] + n * ((off + static_cast<float>(tries)) * G.scale);
+                Vec3 u;
+                float rho;
+                if (sample_prims(G.f, g ? G.to_grid(qb) : qb, u, rho)) v = cp ? (rho - 1.0f) * k.cp_k : length(u) * k.inv_u;
             }
             col[i] = v == v ? map_color(sc, v) : k_unknown;
         }

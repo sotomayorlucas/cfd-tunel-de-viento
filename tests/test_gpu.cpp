@@ -295,6 +295,7 @@ void test_f1(gpu::LbmGpu& G) {
         s->cfg.model = m;
         s->cfg.preset = Preset::Rapida;
         s->cfg.ground = GroundMode::Moving;
+        s->cfg.refine = 0;   // la iGPU sólo admite la red uniforme (el refinamiento local, defecto de los F1, lo rechaza)
         s->init();
     }
     std::string err;

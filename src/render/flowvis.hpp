@@ -187,6 +187,46 @@ struct Probe {
 Probe probe(const lbm::FieldView& f, Vec3 p);
 
 // ============================================================================
+//  Refinamiento local (lbm/refine.cpp): campo COMPUESTO de varias rejillas anidadas.
+//  Todas las posiciones son celdas de la red BASE (el mundo de render); cada rejilla fina cubre su región propia
+//  `inner` con celdas de scale·dx. Las velocidades de red son iguales en todos los niveles (escalado acústico); |ω|
+//  y Q, que se miden "por celda", se reescalan a celdas de la base (×1/scale y ×1/scale²).
+// ============================================================================
+struct GridField {
+    lbm::FieldView f;          // campos de la rejilla (sus celdas; capa fantasma con valores interpolados)
+    Vec3 org{0, 0, 0};         // centro de su celda (0,0,0) en celdas de la base
+    float scale = 1.0f;        // dx / dx de la base (= 2^−nivel)
+    Aabb inner;                // región propia (celdas de la base): allí es la más fina
+    int depth = 0;
+    bool ground = false;       // su capa z = 0 es el suelo
+    CFD_INLINE Vec3 to_grid(Vec3 p) const { return (p - org) * (1.0f / scale); }
+};
+struct MultiField {
+    static constexpr int k_max = 9;
+    GridField g[k_max];
+    int n = 0;
+    const lbm::FieldView& base() const { return g[0].f; }
+    bool refined() const { return n > 1; }
+    // Rejilla más fina cuya región propia contiene p (celdas de la base); 0 = la base.
+    CFD_INLINE int finest(Vec3 p) const {
+        int best = 0, bd = 0;
+        for (int i = 1; i < n; ++i) {
+            const Aabb& b = g[i].inner;
+            if (g[i].depth > bd && p.x >= b.lo.x && p.x <= b.hi.x && p.y >= b.lo.y && p.y <= b.hi.y && p.z >= b.lo.z && p.z <= b.hi.z) {
+                best = i;
+                bd = g[i].depth;
+            }
+        }
+        return best;
+    }
+};
+MultiField single_field(const lbm::FieldView& f);   // una sola rejilla (red uniforme)
+// Escala de una magnitud "por celda" de la rejilla g a celdas de la base (|ω|: 1/scale, Q: 1/scale²; resto 1).
+float quantity_grid_scale(Quantity q, float scale);
+float sample_quantity(const MultiField& m, Quantity q, Vec3 p);   // en la rejilla más fina que contiene p
+Probe probe(const MultiField& m, Vec3 p);
+
+// ============================================================================
 //  FlowSampler — copia EMPAQUETADA del campo para muestreo aleatorio rápido.
 //
 //  Cada celda = 4 × FP16 (ux, uy, uz, ρ-1) = 8 bytes (F16C). Dos celdas
@@ -268,6 +308,49 @@ private:
     alignas(16) float max_[4] = {};  // n-1 (límite de "dentro")
 };
 
+// Muestreador compuesto (refinamiento local): una FlowSampler por rejilla; cada muestra se toma de la rejilla más fina
+// que contiene el punto (celdas de la base). Misma interfaz que FlowSampler para líneas de corriente y humo.
+class MultiSampler {
+public:
+    void update(const MultiField& m);     // reempaqueta todas las rejillas (paralelo)
+    bool ready() const { return n_ > 0 && s_[0].ready(); }
+    int grids() const { return n_; }
+    int nx = 0, ny = 0, nz = 0;           // red base
+    float u_inf = 0.08f;
+    CFD_INLINE int finest(__m128 p) const {
+        alignas(16) float q[4];
+        _mm_store_ps(q, p);
+        int best = 0, bd = 0;
+        for (int i = 1; i < n_; ++i) {
+            const Aabb& b = g_[i].inner;
+            if (g_[i].depth > bd && q[0] >= b.lo.x && q[0] <= b.hi.x && q[1] >= b.lo.y && q[1] <= b.hi.y && q[2] >= b.lo.z && q[2] <= b.hi.z) {
+                best = i;
+                bd = g_[i].depth;
+            }
+        }
+        return best;
+    }
+    CFD_INLINE __m128 to_grid(int i, __m128 p) const { return _mm_mul_ps(_mm_sub_ps(p, _mm_load_ps(org_[i])), _mm_set1_ps(inv_[i])); }
+    CFD_INLINE __m128 sample(__m128 p) const {
+        const int i = finest(p);
+        return i ? s_[i].sample(to_grid(i, p)) : s_[0].sample(p);
+    }
+    CFD_INLINE bool outside(__m128 p) const { return s_[0].outside(p); }
+    CFD_INLINE bool solid(__m128 p) const {
+        const int i = finest(p);
+        return i ? s_[i].solid(to_grid(i, p)) : s_[0].solid(p);
+    }
+    CFD_INLINE void prefetch(float x, float y, float z) const { s_[0].prefetch(x, y, z); }
+    usize memory_bytes() const { usize b = 0; for (int i = 0; i < n_; ++i) b += s_[i].memory_bytes(); return b; }
+
+private:
+    FlowSampler s_[MultiField::k_max];
+    GridField g_[MultiField::k_max];
+    alignas(16) float org_[MultiField::k_max][4] = {};
+    float inv_[MultiField::k_max] = {};
+    int n_ = 0;
+};
+
 // ============================================================================
 //  Rastrillos de siembra (rakes): línea o rejilla 2D de semillas.
 //  seed(i,j) = origin + du·i/(nu-1) + dv·j/(nv-1)   (celdas)
@@ -320,6 +403,7 @@ public:
     void set_seeds(std::span<const Vec3> seeds);
     // Integra todas las semillas en paralelo sobre el campo empaquetado FP16 (ruta rápida).
     void compute(const FlowSampler& s);
+    void compute(const MultiSampler& s);                  // refinamiento local: la rejilla más fina en cada punto
     // Misma integración usando FieldView::velocity() en FP32 (referencia / validación).
     void compute_reference(const lbm::FieldView& f);
     // `behind`: planos translúcidos ya dibujados → los tramos detrás de ellos se atenúan.
@@ -379,6 +463,7 @@ public:
     // Avanza `lattice_steps` pasos de red (× time_scale): advección RK2, reciclaje,
     // emisión y compactación de la salida de dibujo. Paralelo.
     void step(const FlowSampler& s, float lattice_steps);
+    void step(const MultiSampler& s, float lattice_steps);   // refinamiento local (pasos de la red BASE)
     void draw(Framebuffer& fb, const Camera& cam, std::span<const TranslucentPlane> behind = {}) const;
 
     std::span<const Vec3> points() const { return {out_pts_.data(), stats_.alive}; }
@@ -389,6 +474,7 @@ public:
     float effective_max_age() const { return age_max_eff_; }
 
 private:
+    template <class S> void step_impl(const S& s, float lattice_steps);
     void ensure_capacity();
     usize cap_ = 0, head_ = 0;
     Buffer<float> x_, y_, z_, age_;                       // SoA (age = +inf → muerta)
@@ -436,6 +522,11 @@ public:
 
     void set_quantity(Quantity q) { params.quantity = q; params.scale = default_scale(q); }
     void update(const lbm::FieldView& f);                 // recalcula valores + textura (paralelo, AVX2)
+    // Refinamiento local: el plano (params.pos en celdas de la base) se calcula en cada rejilla que lo corta con su
+    // resolución y se compone en una textura con la de la rejilla más fina que lo cruza (hasta ~4 M texeles).
+    // ground_layers: cada rejilla apoyada en el suelo usa su PRIMERA capa de fluido (huella en el suelo).
+    void update(const MultiField& m, bool ground_layers = false);
+    float texels_per_cell() const { return res_; }        // texeles por celda de la base (1 sin refinamiento)
     void draw(Framebuffer& fb, const Camera& cam) const;  // draw_textured_quad (depth_write si opaco)
 
     const u32* texture() const { return tex_.data(); }
@@ -465,7 +556,14 @@ public:
 
 private:
     void build_lic(const lbm::FieldView& f, int k0, int k1, float t);
+    void lic_convolve();                               // convolución LIC sobre vel2_ (ya calculada)
+    void plane_values(const lbm::FieldView& f, Axis ax, float pos, Quantity q, float* out, int tw, int th);
+    void compute_range();                              // eff_, vmin_, vmax_ de vals_
+    void colorize();                                   // textura de vals_ (sin LIC)
+    float value_tex(float u, float v) const;           // valor bilineal en coordenadas de texel
     Buffer<float> vals_;
+    Buffer<float> gbuf_[MultiField::k_max];            // (refinamiento) valores del plano en cada rejilla
+    float res_ = 1.0f;                                 // texeles por celda de la base
     Buffer<u32> tex_;
     Buffer<float> scratch_;
     Buffer<float> vel2_;               // LIC: velocidad en el plano (u, v) por celda
@@ -498,6 +596,7 @@ class GroundFootprint {
 public:
     GroundParams params;
     void update(const lbm::FieldView& f);
+    void update(const MultiField& m);                     // refinamiento: primera capa de fluido de cada rejilla con suelo
     // Textura tw×th: u ↔ X (de extent.lo.x a extent.hi.x), v ↔ Y (de lo.y a hi.y).
     const u32* texture() const { return slice_.texture(); }
     int tex_w() const { return slice_.tex_w(); }
@@ -549,6 +648,8 @@ struct SurfaceParams {
 const char* surface_mode_name(SurfaceMode m);
 // Rellena mesh.color (redimensiona si hace falta). Paralelo sobre vértices.
 void color_mesh(Mesh& mesh, const lbm::FieldView& f, const SurfaceParams& p);
+// Refinamiento local: cada vértice se muestrea en la rejilla más fina que lo contiene, a `offset` celdas DE ESA rejilla.
+void color_mesh(Mesh& mesh, const MultiField& m, const SurfaceParams& p);
 
 // ============================================================================
 //  Volumen de vórtices — Q (o |ω|) en rejilla (opcionalmente 2× reducida),
@@ -592,6 +693,9 @@ class VortexVolume {
 public:
     VolumeParams params;
     void update(const lbm::FieldView& f);                 // Q/|ω| + cuantización + ladrillos (paralelo)
+    // Refinamiento local: rejilla de volumen de la base (con downsample); cada vóxel promedia las celdas de la rejilla más
+    // fina que contiene su centro (Q/|ω| calculados en cada rejilla con su dx y pasados a unidades de la base).
+    void update(const MultiField& m);
     // Compone sobre fb dentro de cam.vp ∩ framebuffer. `behind`: hasta 4 planos translúcidos ya dibujados
     // (el tramo del rayo detrás de cada uno pesa ×(1-opacity)).
     void render(Framebuffer& fb, const Camera& cam, std::span<const TranslucentPlane> behind = {});
@@ -600,8 +704,10 @@ public:
 
 private:
     void count_bricks();
+    void build_bricks(float vmax);
     u32 iso_index() const;
     Buffer<u8> dens_, col_, brick_;
+    Buffer<float> gq_[MultiField::k_max], gu_[MultiField::k_max];   // (refinamiento) Q/|ω| y u_x por celda de cada rejilla
     Buffer<float> scratch_;
     Buffer<u32> low_;                  // RGBA premultiplicado (media resolución)
     Buffer<float> low_depth_;          // profundidad de vista del primer aporte

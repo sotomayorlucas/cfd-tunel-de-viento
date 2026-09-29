@@ -106,6 +106,9 @@ bool App::setup(const Options& o, bool headless) {
     sim.cfg.cells = o.cells;
     sim.cfg.fp32 = o.fp32;
     sim.cfg.gpu = o.gpu;
+    // La iGPU sólo admite la red uniforme: con --gpu y sin --refine explícito, sin refinamiento.
+    sim.cfg.refine = (o.gpu && o.refine < 0 && o.refine_boxes.empty()) ? 0 : o.refine;
+    sim.cfg.manual_boxes = o.refine_boxes;
     sim.cfg.nu = o.nu;
     if (o.cs >= 0.0f) sim.cfg.cs = o.cs;
     if (o.wall >= 0) sim.cfg.wall = static_cast<lbm::WallModel>(o.wall);
@@ -142,6 +145,7 @@ bool App::setup(const Options& o, bool headless) {
             else if (k == "footprint" || k == "huella") v.footprint = true;
             else if (k == "nofootprint" || k == "nohuella") v.footprint = false;
             else if (k == "arrows" || k == "flechas") v.arrows = true;
+            else if (k == "boxes" || k == "cajas") v.level_boxes = true;
             else if (k == "noarrows" || k == "noflechas") v.arrows = false;
             else if (k == "comp-arrows") { v.arrows = true; v.comp_arrows = true; }
             else if (k == "nowire") v.wire = false;
@@ -224,6 +228,7 @@ void App::sync_ui_from_sim() {
     ui_preset = static_cast<int>(sim.cfg.preset);
     ui_fp32 = sim.cfg.fp32;
     ui_gpu = sim.gpu_on();
+    ui_refine = sim.cfg.refine;
     ui_wall = sim.cfg.wall;
     ui_interp_bb = sim.cfg.interp_bb;
     ui_ramp_ft = sim.cfg.ramp_ft;
@@ -284,14 +289,20 @@ void App::reinit() {
     sim.cfg.wall = ui_wall;
     sim.cfg.interp_bb = ui_interp_bb;
     sim.cfg.ramp_ft = ui_ramp_ft;
+    sim.cfg.refine = ui_refine;
     sim.init();
     view.dirty = true;
     view.rakes_dirty = true;
     view.frame(sim, cam_view, viewport_rect());
     sync_ui_from_sim();
-    ui.toast(ui.style().accent, "Reiniciado: %s, %s · %d×%d×%d (%.2f M celdas), dx %.1f mm", preset_name(sim.cfg.preset),
-             sim.cfg.fp32 ? "FP32" : "FP16S", sim.dom.nx, sim.dom.ny, sim.dom.nz, static_cast<double>(sim.dom.cells()) * 1e-6,
-             static_cast<double>(sim.dom.dx * 1e3f));
+    if (sim.levels.empty())
+        ui.toast(ui.style().accent, "Reiniciado: %s, %s · %d×%d×%d (%.2f M celdas), dx %.1f mm", preset_name(sim.cfg.preset),
+                 sim.cfg.fp32 ? "FP32" : "FP16S", sim.dom.nx, sim.dom.ny, sim.dom.nz, static_cast<double>(sim.dom.cells()) * 1e-6,
+                 static_cast<double>(sim.dom.dx * 1e3f));
+    else
+        ui.toast(ui.style().accent, "Reiniciado: %s, %s · %d niveles finos, %.2f M celdas, dx %.1f → %.1f mm", preset_name(sim.cfg.preset),
+                 sim.cfg.fp32 ? "FP32" : "FP16S", sim.refine_levels(), static_cast<double>(sim.total_cells) * 1e-6,
+                 static_cast<double>(sim.dom.dx * 1e3f), static_cast<double>(sim.levels.back().dx * 1e3f));
 }
 
 // ============================================================================
@@ -445,6 +456,7 @@ void App::frame(int steps_override, bool render_frame) {
             perf.step_s = {};
         }
         ui_gpu = sim.gpu_on();
+    ui_refine = sim.cfg.refine;
     }
     if (want_ground) {
         want_ground = false;

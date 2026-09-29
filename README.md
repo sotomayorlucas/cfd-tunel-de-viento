@@ -24,6 +24,12 @@ AVX2/FMA/F16C, sin AVX-512; ~82 GB/s de memoria).
   en sólidos con paredes móviles (ruedas, cinta), entrada/salida/campo lejano, esponja de salida y
   fuerzas por pieza (intercambio de momento). ~800 MLUPS en FP16S en este portátil con un F1 a
   resolución media (núcleo ~950 MLUPS + la pasada de fuerzas/pared del rebote interpolado).
+* **Refinamiento local por bloques** (`--refine 0|1|2`, defecto en los F1): cajas de celdas 2 y 4 veces más finas
+  (2:1 anidadas) alrededor del coche con el suelo debajo, del alerón delantero, del fondo + difusor y del alerón
+  trasero, elegidas del modelo (o a mano con `--refine-box`), con el mismo presupuesto de celdas. Cada nivel usa el
+  mismo kernel; interfaces por momentos con reescalado del no equilibrio (interpolación trilineal en espacio y lineal
+  en tiempo, restricción por medias) y fuerzas sumadas sin doble cuenta. La visualización muestrea siempre la rejilla
+  más fina. A Media el F1 2022 pasa de SCz 0.83 a 1.40 m² y su altura efectiva de 125/175 a 47/97 mm (ver límites).
 * **Modelos paramétricos** (18): nueve F1 (Lotus 49 de 1967, Lotus 79 coche-ala, vía estrecha de
   1998, apéndices de 2008, alerón ancho + DRS de 2011, híbrido de 2014, coches anchos de 2019, efecto
   suelo de 2022 y aero activa de 2026 con modos Z/X), alas NACA 0012/4412, ala F1 de 2 elementos en
@@ -144,11 +150,20 @@ Opciones principales: `--model`, `--res rapida|media|alta|ultra` (2.5 / 6 / 13 /
   "ley logarítmica" o "sin ley", panel Túnel → Física del solver, o `--wall`, `--bb`). La tensión de
   pared usa el Reynolds **real** de la velocidad elegida: la velocidad no sólo reescala N/kgf,
   también cambia (poco) la fricción.
+* **Refinamiento local (límites honestos).** Con 2 niveles (defecto de los F1 desde Media) el alerón delantero tiene 3-4
+  veces más celdas de cuerda y su carga se duplica; la carga total de un F1 moderno sube de ~0.8 a ~1.4 m² (real ~4-5) y el
+  resultado ya no cambia de Media a Alta, pero el **fondo casi no carga** (el efecto suelo de los túneles no aparece aún),
+  el alerón trasero sigue en una estela lenta y la resistencia apenas cambia. Cuesta ~2-3 veces más por paso de flujo
+  que la red uniforme del mismo preset (las rejillas finas hacen 2/4 subpasos y resuelven casi toda la superficie). Donde
+  una caja corta una pared no deslizante la fricción local sale unos % alta; la masa no se conserva exactamente
+  (≈ 5·10⁻⁶ relativo en un chapoteo violento en caja cerrada). La iGPU no lo admite (`--gpu` usa la red uniforme).
+  Detalles y validación: `docs/FISICA.md` §1.6 y §5.0.
 * **Altura de marcha efectiva.** Bajo el fondo hacen falta ~3.5 celdas de hueco para que pase aire
   (con 2.5 el fondo de los F1 seguía dando sustentación): con alturas menores la red sube el coche (la menor
-  altura h pasa a (h⁴ + g⁴)^¼, g = 3.5·dx, rake conservado; ≈ h en cuanto h ≳ 1.5·g). A resolución media
-  (dx 35.6 mm) un F1 2022 pedido a 30/80 mm se simula a **125/175 mm** (97/147 a Alta, 76/126 a Ultra); el
-  panel y el HUD lo indican en ámbar. Consecuencia: a Media/Alta un barrido de altura de un F1 por debajo de
+  altura h pasa a (h⁴ + g⁴)^¼, g = 3.5·dx, rake conservado; ≈ h en cuanto h ≳ 1.5·g), con la dx **más fina bajo el
+  fondo**. Con la red uniforme a Media (dx 35.6 mm) un F1 2022 pedido a 30/80 mm se simulaba a **125/175 mm**; con el
+  refinamiento local por defecto (caja del fondo a 12.8 mm) a **47/97 mm** (38/88 a Alta); el panel y el HUD lo indican
+  en ámbar. Consecuencia: a Media/Alta un barrido de altura de un F1 por debajo de
   ~10 cm apenas cambia la geometría simulada (10/60 y 30/80 dan los dos 125/175 mm) y sus diferencias son
   ruido. Para estudiar el efecto suelo de verdad usa el ala aislada (`f1_wing_ge`, dx de 10-15 mm).
 * **Fuerzas.** Intercambio de momento por pieza, manométrico (p − p∞: una pieza apoyada en el suelo,
@@ -168,6 +183,10 @@ Detalle completo (método, pruebas de las correcciones de fuerza, tabla de calib
 predice y qué no) en [`docs/FISICA.md`](docs/FISICA.md).
 
 ### Estado de la calibración (honesto)
+
+> La tabla siguiente es de la **red uniforme** (`--refine 0`). Con el refinamiento local (defecto de los F1) a Media:
+> F1 2022 SCz / SCx **1.40 / 2.17** (DRS abierto 0.97 / 2.04), F1 2019 1.44 / 2.18, F1 1967 −0.14 / 0.86; tabla
+> completa antes/después en `docs/FISICA.md` §5.0.
 
 Preset **Media** (6 M celdas, dx 29-36 mm en los coches), 4 pasos de flujo (coches) o 5 (objetos), cinta
 móvil y ruedas girando, alturas por defecto de cada época (suben a ~12-15 cm efectivos por la resolución).
@@ -231,6 +250,11 @@ ingeniero calibrando el solver con 20 hilos: carga media 15-45); sólo hubo dos 
 la de las 07:19 (rebote en escalera) y la actual (rebote interpolado de Bouzidi + ley de pared, cuya
 pasada de fuerzas/pared es ~3× más cara).
 
+**Refinamiento local** (defecto de los F1; `docs/opt/lbm.md` §6): a Media el F1 2022 con 2 niveles cuesta ≈ 2.9 veces
+más por paso de flujo que la red uniforme del mismo preset (≈ 400 MLUPS equivalentes; `--bench --res media`: 210 ms por
+cuadro de 4 pasos frente a 64 con `--refine 0`, medidos seguidos con el portátil ya caliente); la visualización compuesta
+cuesta lo mismo que antes (5-7 ms). Para máxima fluidez: `--refine 0` o Rápida (1 nivel).
+
 | Caso | Celdas | Solver | Cuadro completo | Desglose del cuadro |
 |---|---|---|---|---|
 | **Actual**, `--bench --res media`, k = 4 pasos/cuadro, sin ventana (12:15, carga 1.8) | 6.08 M (512×135×88, dx 35.6 mm) | **790 MLUPS** (núcleo 6.5 ms/paso + fuerzas y pared 1.2 ms/paso) | 47.5 ms (21 FPS) | sim 35.8 · vis 4.0 · render 7.5 (malla 1.9, flujo 1.4, post 1.8) · UI 0.14 ms |
@@ -278,7 +302,9 @@ con ordenación por conteo sin atómicos, campo empaquetado FP16 para líneas de
 ## Tests
 
 `make test` ejecuta todos los tests de módulo (solver, geometría, modelos, rasterizador,
-visualización, UI), `tests/test_aero.cpp` (calibración física) y `tests/test_app.cpp`:
+visualización, UI), `tests/test_refine.cpp` (refinamiento local: flujo uniforme, masa, Couette a través de la
+interfaz, esfera refinada frente a uniforme fina, reflexión acústica, fuerzas de un cuerpo que cruza una caja,
+reinicio y rechazo de la iGPU), `tests/test_aero.cpp` (calibración física) y `tests/test_app.cpp`:
 dimensionado del dominio (18 modelos × 4 presets), balance con fuerzas sintéticas, línea de
 órdenes, saneado de parámetros (rake, holgura con el suelo), fuerzas en reposo, extremo a extremo
 sin ventana, barrido con CSV, los 18 modelos dentro de la app (todas las superficies, cortes y

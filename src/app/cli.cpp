@@ -55,6 +55,11 @@ void print_usage(const char* argv0) {
         "                             rear_flap (°), drs (0/1), yaw (°), aoa (°), height (mm), gap (mm), wheels (0/1)\n"
         "  --fp32                     poblaciones en FP32 (defecto FP16S)\n"
         "  --gpu                      solver en la iGPU (Vulkan de cómputo propio; la CPU dibuja en paralelo)\n"
+        "  --refine 0|1|2             niveles de refinamiento local (cajas finas 2:1 alrededor del objeto y, en\n"
+        "                             los F1, de alerones y fondo). Defecto: F1 → 2 (1 en Rápida), resto → 0.\n"
+        "                             La iGPU no lo admite (con --gpu usar --refine 0)\n"
+        "  --refine-box x0,y0,z0,x1,y1,z1[,n]   caja fina manual (m, espacio modelo) de nivel n = 1 o 2\n"
+        "                             (repetible; sustituye a las automáticas: 1 de nivel 1 + las de nivel 2)\n"
         "  --nu <valor>               viscosidad de red (defecto automática)\n"
         "  --cs <valor>               constante de Smagorinsky del LES (defecto 0.10; 0 = sin LES)\n"
         "  --prio fluidez|equilibrado|max   reparto del cuadro entre simulación y visualización (ventana)\n"
@@ -133,6 +138,26 @@ bool parse_cli(int argc, const char* const* argv, Options& o) {
             o.params.push_back(cp);
         } else if (a == "--fp32") o.fp32 = true;
         else if (a == "--gpu") o.gpu = true;
+        else if (a == "--refine-box") {
+            if (!(v = need(i, "--refine-box"))) return false;
+            float q[7] = {0, 0, 0, 0, 0, 0, 1};
+            int nq = 0;
+            for (const char* c = v; *c && nq < 7;) {
+                char* e;
+                q[nq++] = std::strtof(c, &e);
+                if (e == c) break;
+                c = *e == ',' ? e + 1 : e;
+            }
+            if (nq < 6 || q[3] <= q[0] || q[4] <= q[1] || q[5] <= q[2]) { o.error = "--refine-box x0,y0,z0,x1,y1,z1[,nivel] (m)"; return false; }
+            ManualBox mb;
+            mb.box_m = Aabb{Vec3(q[0], q[1], q[2]), Vec3(q[3], q[4], q[5])};
+            mb.depth = nq >= 7 ? clamp_(static_cast<int>(q[6]), 1, 2) : 1;
+            o.refine_boxes.push_back(mb);
+        } else if (a == "--refine") {
+            if (!(v = need(i, "--refine"))) return false;
+            o.refine = std::atoi(v);
+            if (o.refine < 0 || o.refine > 2) { o.error = "--refine: 0, 1 o 2"; return false; }
+        }
         else if (a == "--nu") {
             if (!(v = need(i, "--nu"))) return false;
             if (!parse_float(v, o.nu) || o.nu <= 0 || o.nu > 0.1f) { o.error = "--nu necesita un número en (0, 0.1]"; return false; }
@@ -250,6 +275,9 @@ void print_results(const Sim& s) {
     std::printf("[cfd] %s — %s · red %dx%dx%d (%.2f M celdas) dx %.2f mm · %s · suelo %d · ν %.1e\n", I.id.c_str(), I.name.c_str(), s.dom.nx,
                 s.dom.ny, s.dom.nz, static_cast<double>(s.dom.cells()) * 1e-6, static_cast<double>(s.dom.dx * 1e3f), s.cfg.fp32 ? "FP32" : "FP16S",
                 static_cast<int>(s.cfg.ground), static_cast<double>(s.nu));
+    for (const LevelPlan& L : s.levels)   // refinamiento local
+        std::printf("[cfd]   nivel %d (%s): %dx%dx%d (%.2f M celdas) dx %.2f mm%s\n", L.depth, L.name, L.nx, L.ny, L.nz,
+                    static_cast<double>(L.cells()) * 1e-6, static_cast<double>(L.dx * 1e3f), L.ground ? " · apoyada en el suelo" : "");
     std::printf("[cfd] pasos %llu (%.2f pasos de flujo) · %s (Δ %.2f %%)\n", static_cast<unsigned long long>(s.solver.steps()),
                 static_cast<double>(s.flow_throughs()), s.converged ? "convergido" : "sin converger", static_cast<double>(s.conv_rel * 100.0f));
     std::printf("[cfd] CL(carga+) %+.4f  CD %.4f  CS %+.4f  SCz %+.4f m²  SCx %.4f m²  L/D %.3f", static_cast<double>(r.cl), static_cast<double>(r.cd),
@@ -308,6 +336,10 @@ int run_headless(const Options& o) {
     std::printf("[cfd] %s: red %dx%dx%d (%.2f M celdas), dx %.2f mm, paso de flujo = %.0f pasos → simulando %ld pasos (%.2f PF)\n",
                 s.built.info.id.c_str(), s.dom.nx, s.dom.ny, s.dom.nz, static_cast<double>(s.dom.cells()) * 1e-6,
                 static_cast<double>(s.dom.dx * 1e3f), static_cast<double>(ft), total, static_cast<double>(total) / static_cast<double>(ft));
+    if (!s.levels.empty())
+        std::printf("[cfd] refinamiento local: %d cajas, %d niveles finos, %.2f M celdas en total, dx más fina %.2f mm\n",
+                    static_cast<int>(s.levels.size()), s.refine_levels(), static_cast<double>(s.total_cells) * 1e-6,
+                    static_cast<double>(s.levels.back().dx * 1e3f));
     const double t0 = now_sec();
     if (o.sweep) {
         app.sweep.param = o.sweep_param;
@@ -475,6 +507,8 @@ int run_stability(const Options& in) {
             s.cfg.cells = in.cells;
             s.cfg.fp32 = in.fp32;
             s.cfg.gpu = in.gpu;
+            s.cfg.refine = (in.gpu && in.refine < 0) ? 0 : in.refine;   // la iGPU sólo con la red uniforme
+            s.cfg.manual_boxes = in.refine_boxes;
             s.cfg.nu = in.nu;
             s.cfg.ground = in.ground >= 0 ? static_cast<lbm::GroundMode>(in.ground)
                                           : (models::info(m).needs_ground ? lbm::GroundMode::Moving : lbm::GroundMode::None);
@@ -499,8 +533,9 @@ int run_stability(const Options& in) {
             }
             ++total;
             bad += div;
-            std::printf("[estabilidad] %-6s %-14s %4dx%4dx%4d dx %5.1f mm ν %.1e: %s tras %ld pasos (%.1f PF) · |u|₁ máx %.3f · %.0f MLUPS · %.1f s\n",
+            std::printf("[estabilidad] %-6s %-14s %4dx%4dx%4d dx %5.1f mm (+%d niv., fina %4.1f mm, %.1f M celdas) ν %.1e: %s tras %ld pasos (%.1f PF) · |u|₁ máx %.3f · %.0f MLUPS · %.1f s\n",
                         preset_key(p), models::info(m).id.c_str(), s.dom.nx, s.dom.ny, s.dom.nz, static_cast<double>(s.dom.dx * 1e3f),
+                        s.refine_levels(), static_cast<double>((s.levels.empty() ? s.dom.dx : s.levels.back().dx) * 1e3f), static_cast<double>(s.total_cells) * 1e-6,
                         static_cast<double>(s.nu), div ? "DIVERGE" : "estable", done, static_cast<double>(done) / static_cast<double>(s.ft_steps()),
                         static_cast<double>(umax), s.solver.last_mlups(), now_sec() - t1);
             std::fflush(stdout);

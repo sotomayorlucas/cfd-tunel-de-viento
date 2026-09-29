@@ -74,6 +74,42 @@ struct DomainPlan {
 DomainPlan plan_domain(int model, const models::Params& p, bool ground_layout, usize budget);
 
 // ============================================================================
+//  Refinamiento local (lbm/refine.cpp; docs/FISICA.md §1.6)
+// ============================================================================
+// Una rejilla fina (caja anidada 2:1). Nivel 1 = caja alrededor del objeto (con el suelo debajo en los coches);
+// nivel 2 (F1) = alerón delantero, fondo + difusor (la franja bajo el coche) y alerón trasero + beam wing.
+struct LevelPlan {
+    const char* name = "";     // "coche", "alerón delantero", "fondo", "alerón trasero", "objeto"
+    int parent = 0;            // rejilla padre (0 = red base, k = LevelPlan k−1)
+    int depth = 1;
+    Aabb box_m;                // región pedida (m, espacio modelo)
+    // Rellenado por Sim::init con la caja normalizada del solver:
+    LatticeMap map;            // modelo (m) ↔ celdas de esta rejilla
+    int nx = 0, ny = 0, nz = 0;
+    float dx = 0.0f;           // m
+    bool ground = false;       // apoyada en el suelo
+    Aabb inner_m;              // región propia efectiva (m)
+    usize cells() const { return static_cast<usize>(nx) * static_cast<usize>(ny) * static_cast<usize>(nz); }
+};
+struct RefinePlan {
+    DomainPlan dom;            // red base
+    std::vector<LevelPlan> levels;
+    lbm::LevelBox boxes[lbm::k_max_boxes];   // en celdas del padre (normalizadas con lbm::Solver::normalize_boxes)
+    int n_boxes = 0;
+    usize total_cells = 0;     // red base + rejillas finas
+    float dx_under = 0.0f;     // dx (m) de la rejilla más fina bajo el fondo (altura de marcha efectiva)
+};
+// Caja fina manual (--refine-box): región en metros (espacio modelo) y nivel (1 o 2). Sustituyen a las automáticas: una caja
+// de nivel 1 (si no se da, la automática del objeto) y cualquier número de nivel 2 dentro de ella.
+struct ManualBox { Aabb box_m; int depth = 1; };
+// Niveles finos por defecto (0 = red uniforme): F1 → 2 en Media/Alta/Ultra, 1 en Rápida; el resto 0.
+int default_refine(int model, Preset p);
+// Túnel + cajas finas para `budget` celdas EN TOTAL (red base + finas: el presupuesto de memoria del preset) con `refine`
+// niveles (0 → plan_domain). Las cajas cubren la envolvente de los deslizadores (como el dominio).
+RefinePlan plan_refined(int model, const models::Params& p, bool ground_layout, usize budget, int refine,
+                        const std::vector<ManualBox>* manual = nullptr);
+
+// ============================================================================
 //  Parámetros: rangos de la UI y saneado
 // ============================================================================
 struct Range { float lo = 0, hi = 0; };
@@ -167,6 +203,9 @@ struct SimConfig {
     lbm::Collision collision = lbm::Collision::Recursive;
     float bulk_omega = 1.0f;       // relajación de la traza de Π^neq (viscosidad de volumen); 0 = la de la cortante
     int rr_wall_layer = 8;         // capa (celdas) junto a los cuerpos sin el término de 3er orden (lbm::Config)
+    // ---- Refinamiento local (docs/FISICA.md §1.6) ----
+    int refine = -1;               // niveles finos: −1 = automático (default_refine), 0 = red uniforme, 1, 2
+    std::vector<ManualBox> manual_boxes;   // --refine-box (vacío = cajas automáticas)
 };
 
 struct RebuildTimes { double build = 0, vox = 0, geo = 0, mesh = 0, total = 0; };
@@ -190,6 +229,15 @@ public:
     DomainPlan dom;
     lbm::Solver solver;
     Buffer<u8> solid;
+    // ---- Refinamiento local ----
+    std::vector<LevelPlan> levels;           // rejillas finas (grid g del solver = levels[g−1])
+    std::vector<Buffer<u8>> lv_solid;        // su geometría (vóxeles)
+    float dx_under = 0.0f;                   // dx (m) más fina bajo el fondo: la que fija la altura efectiva
+    usize total_cells = 0;                   // red base + finas
+    int refine_levels() const;               // niveles finos en uso (0, 1, 2)
+    // Campo compuesto de todas las rejillas para la visualización (celdas de la red base; ver flowvis::MultiField).
+    flowvis::MultiField multi_field() const;
+    int refine_wanted() const;               // cfg.refine resuelto (−1 → default_refine)
     render::Mesh mesh;             // malla suave (render)
     render::Mesh vox_mesh;         // lo que ve el solver (vista de vóxeles)
     bool vox_dirty = true;
@@ -270,10 +318,15 @@ private:
     float wall_speed_ = -1.0f;     // speed_kmh con la que se fijó wall_nu en el solver
     void sync_wall_law();          // wall_nu ← wall_nu_lat() si cambió speed_kmh
     void update_rho_ref();         // rho_ref ← ρ medio del plano de referencia aguas arriba
-    usize fill_contact_pockets();  // huella de contacto de las ruedas (ver sim.cpp)
+    usize fill_contact_pockets(u8* solid_ids, int nx, int ny, int nz, bool grounded);   // huella de contacto (ver sim.cpp)
+public:
+    static float level_wall_sdf(const void* ctx, Vec3 p_cells);   // lbm::WallSdf de una rejilla fina (ctx = LvCtx)
+private:
     void update_effective_params();   // params → params_eff (altura de marcha efectiva)
     void set_moment_ref();
     void apply_wall_motions();
+    struct LvCtx { const Sim* s = nullptr; int l = 0; };   // contexto de la distancia a la pared de cada rejilla fina
+    LvCtx lv_ctx_[lbm::k_max_boxes];
     void rebuild_geometry(float mesh_fraction);
     void reset_forces();
 };
@@ -361,6 +414,7 @@ struct VisSettings {
     float q_threshold = 20.0f;     // umbral de Q en unidades del objeto: Q·L²/U∞² (independiente de la resolución)
     bool vortex_cloud = false;
     bool footprint = true;
+    bool level_boxes = false;      // cajas de refinamiento local (alambre)
     bool arrows = true;
     bool comp_arrows = false;
     bool wire = true;
@@ -374,7 +428,7 @@ struct VisSettings {
 struct View {
     render::Camera cam;
     VisSettings vs;
-    flowvis::FlowSampler sampler;
+    flowvis::MultiSampler sampler;     // (refinamiento local: una FlowSampler por rejilla; la más fina en cada punto)
     flowvis::SliceView slice;
     flowvis::Streamlines lines;
     flowvis::Particles smoke;
@@ -426,6 +480,8 @@ struct Options {
     std::vector<CliParam> params;
     bool fp32 = false;
     bool gpu = false;              // --gpu: solver en la iGPU
+    int refine = -1;               // --refine 0|1|2 (−1 = automático)
+    std::vector<ManualBox> refine_boxes;   // --refine-box x0,y0,z0,x1,y1,z1[,nivel] (m)
     int threads = 0;
     bool headless = false;
     long steps = -1;               // pasos de red (sin ventana: por defecto 2 pasos de flujo)
@@ -522,6 +578,7 @@ struct App {
     lbm::WallModel ui_wall = lbm::WallModel::Slip;   // (se sincronizan con SimConfig en sync_ui_from_sim)
     bool ui_interp_bb = true;
     bool ui_gpu = false;           // conmutador "Solver: CPU / iGPU" del panel
+    int ui_refine = -1;            // niveles de refinamiento local (−1 = automático)
     bool want_gpu = false;         // ui_gpu → Sim::set_gpu
     float ui_ramp_ft = 0.0f;
     bool want_res_apply = false;   // "Aplicar resolución": descarta un --cells explícito

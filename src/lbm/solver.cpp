@@ -28,11 +28,8 @@
 //  ρ-1 = Σ f̃ sin cancelación catastrófica → más precisión en FP16 y en FP32.
 // ============================================================================
 #include "solver.hpp"
-#include "lattice.hpp"
-#include "../core/mem.hpp"
-#include "../core/simd.hpp"
+#include "solver_impl.hpp"
 #include "../core/threadpool.hpp"
-#include "../core/util.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -45,302 +42,6 @@
 
 namespace cfd::lbm {
 namespace {
-
-namespace L = d3q19;
-using simd::f8;
-
-constexpr float kScale = 32768.0f;           // FP16S: f̃·2^15 en IEEE half (exacto: potencia de 2)
-constexpr float kInvScale = 1.0f / 32768.0f;
-constexpr float kSpongeNu = 0.12f;           // viscosidad máxima al final de la esponja (τ ≈ 0.86)
-
-// Clase de cada bloque de 8 celdas (precalculada con SWAR sobre los flags en set_geometry).
-enum BlockClass : u8 {
-    kBlkSkip = 0,     // 8 sólidos: no se procesa (sólo se rellenan ρ,u en pasos macro)
-    kBlkPure = 1,     // 8 fluidos normales: ruta AVX2 sin máscaras
-    kBlkMasked = 2,   // hay sólidos o fronteras de equilibrio: AVX2 con mezclas por carril
-    kBlkScalar = 3,   // pared móvil cerca (kNearMoving / kMoving) que no es sólo la cinta: ruta escalar
-    kBlkGround = 4,   // capa z=1 sobre la cinta móvil: AVX2 con máscaras + corrección de Ladd constante
-    kBlkWall = 8,     // BIT añadido a Pure/Masked/Ground: algún carril junto a pared con ley de pared
-    kBlkLayer = 16,   // BIT: bloque en la capa junto a los cuerpos (kLayer en sus 8 carriles): sin término de 3er orden
-};
-// Bit interno de flags (no forma parte de field.hpp): celda kNearMoving cuyo ÚNICO vecino móvil
-// es el suelo (cinta a u_g x̂). La corrección de pared móvil sobre ella es la misma en todas:
-// sólo las direcciones 9 = (1,0,1) y 16 = (-1,0,1) reciben ±6 w u_g (c_x u_g ≠ 0 y vienen de z-1).
-constexpr u8 kGroundOnly = 1u << 5;
-// Bit interno de flags: celda de fluido (no frontera) con algún vecino sólido en las 18 direcciones
-// → primera celda junto a la pared: ley de pared (WallModel::LogLaw). Los consumidores de FieldView
-// usan máscaras (flags & kSolid), así que un bit interno más no les afecta.
-constexpr u8 kNearWall = 1u << 6;
-// Bit interno de flags: celda en la CAPA junto a los cuerpos (Config::rr_wall_layer celdas de un sólido que no es el
-// suelo, extendida a bloques completos de 8 en x) donde la colisión recursiva NO añade su término de 3er orden (= la
-// proyección de 2º orden). Ver collide y docs/FISICA.md §1.5: con RR también en la capa límite los perfiles se
-// desprendían (NACA 0012 a 6°, Media: CL 0.30 → 0.13) y cambiaba toda la calibración.
-constexpr u8 kLayer = 1u << 7;
-// Distancia de la primera celda a la pared (rebote a mitad de enlace) en la ley de pared (modelo LogLaw).
-constexpr float kWallY = 0.5f;
-// Suelo de estabilidad de la ley de pared: τ ≥ ½ + kWallFloor·(τ_LES − ½) (ver wall_omc). Medido en el F1 2022
-// a 2.5 M celdas: sin suelo diverge en ~400 pasos (huecos de 1-2 celdas bajo el fondo y junto a las ruedas);
-// con 0.25 y 0.5 estable 2.5 pasos de flujo. Se toma el menor (menos fricción espuria).
-constexpr float kWallFloor = 0.25f;
-
-struct Motion { Vec3 v{0, 0, 0}, omega{0, 0, 0}, center{0, 0, 0}; float contact_z = -1.0f; Vec3 vc{0, 0, 0}; bool conserve = false; };
-
-CFD_INLINE Vec3 wall_velocity(const Motion& m, float x, float y, float z) {
-    if (z <= m.contact_z) return m.vc;   // huella de contacto: se mueve con la cinta
-    return m.v + cross(m.omega, Vec3(x, y, z) - m.center);
-}
-
-// ---- Operaciones genéricas (float escalar o f8 AVX2): UN solo código de colisión -------------
-CFD_INLINE float vfma(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
-CFD_INLINE f8 vfma(f8 a, f8 b, f8 c) { return simd::fmadd(a, b, c); }
-CFD_INLINE float vfnma(float a, float b, float c) { return __builtin_fmaf(-a, b, c); }
-CFD_INLINE f8 vfnma(f8 a, f8 b, f8 c) { return simd::fnmadd(a, b, c); }
-CFD_INLINE float vsqrt(float a) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(a))); }
-CFD_INLINE f8 vsqrt(f8 a) { return simd::sqrt(a); }
-
-// Dos bloques de 8 celdas "entrelazados" (16 carriles): el MISMO código genérico de colisión
-// genera dos cadenas de dependencias independientes que el núcleo fuera de orden solapa
-// (segmentación software). Medido con llvm-mca: ver docs/opt/lbm.md.
-struct f8x2 {
-    f8 a, b;
-    f8x2() = default;
-    CFD_INLINE f8x2(f8 x, f8 y) : a(x), b(y) {}
-    CFD_INLINE explicit f8x2(float s) : a(s), b(s) {}
-    CFD_INLINE f8x2 operator+(f8x2 o) const { return {a + o.a, b + o.b}; }
-    CFD_INLINE f8x2 operator-(f8x2 o) const { return {a - o.a, b - o.b}; }
-    CFD_INLINE f8x2 operator*(f8x2 o) const { return {a * o.a, b * o.b}; }
-    CFD_INLINE f8x2 operator/(f8x2 o) const { return {a / o.a, b / o.b}; }
-    CFD_INLINE f8x2& operator+=(f8x2 o) { a += o.a; b += o.b; return *this; }
-    CFD_INLINE f8x2& operator-=(f8x2 o) { a -= o.a; b -= o.b; return *this; }
-    CFD_INLINE f8x2& operator*=(f8x2 o) { a *= o.a; b *= o.b; return *this; }
-};
-CFD_INLINE f8x2 vfma(f8x2 x, f8x2 y, f8x2 z) { return {vfma(x.a, y.a, z.a), vfma(x.b, y.b, z.b)}; }
-CFD_INLINE f8x2 vfnma(f8x2 x, f8x2 y, f8x2 z) { return {vfnma(x.a, y.a, z.a), vfnma(x.b, y.b, z.b)}; }
-CFD_INLINE f8x2 vsqrt(f8x2 x) { return {vsqrt(x.a), vsqrt(x.b)}; }
-
-// Momentos "en flujo": las poblaciones se consumen POR PARES opuestos según se cargan
-// (s = f_i + f_{i+1} → ρ, Π;  d = f_i - f_{i+1} → j) y se acumulan en 10 registros.
-// Así nunca hay 19 valores vivos a la vez → sin derrames a la pila (medido: -80 vmovaps/bloque).
-// ld(k) devuelve la población k (desplazada; en FP16S aún escalada por 2^15: el reescalado se
-// pliega después en 1/ρ y en las FMAs de Π, nunca en las 19 poblaciones).
-template <class V> struct Mom { V drho, jx, jy, jz, pxx, pyy, pzz, pxy, pxz, pyz; };
-
-template <class V, class Ld>
-CFD_INLINE Mom<V> moments(const Ld& ld) {
-    // Dos juegos de acumuladores INDEPENDIENTES (ejes / diagonales) que se suman al final:
-    // la cadena de dependencias de ρ baja de 10 a ~6 sumas (latencia 4 c/u) → más solape entre bloques.
-    Mom<V> m, g;
-    V a = ld(1), b = ld(2);                                   // ±x
-    V s = a + b, d = a - b;
-    m.drho = ld(0) + s; m.jx = d; m.pxx = s;
-    a = ld(3); b = ld(4); s = a + b; d = a - b;               // ±y
-    m.drho += s; m.jy = d; m.pyy = s;
-    a = ld(5); b = ld(6); s = a + b; d = a - b;               // ±z
-    m.drho += s; m.jz = d; m.pzz = s;
-    a = ld(7); b = ld(8); s = a + b; d = a - b;               // ±(1,1,0)
-    g.drho = s; g.jx = d; g.jy = d; g.pxx = s; g.pyy = s; m.pxy = s;
-    a = ld(9); b = ld(10); s = a + b; d = a - b;              // ±(1,0,1)
-    g.drho += s; g.jx += d; g.jz = d; g.pxx += s; g.pzz = s; m.pxz = s;
-    a = ld(11); b = ld(12); s = a + b; d = a - b;             // ±(0,1,1)
-    g.drho += s; g.jy += d; g.jz += d; g.pyy += s; g.pzz += s; m.pyz = s;
-    a = ld(13); b = ld(14); s = a + b; d = a - b;             // ±(1,-1,0)
-    g.drho += s; g.jx += d; g.jy -= d; g.pxx += s; g.pyy += s; m.pxy -= s;
-    a = ld(15); b = ld(16); s = a + b; d = a - b;             // ±(1,0,-1)
-    g.drho += s; g.jx += d; g.jz -= d; g.pxx += s; g.pzz += s; m.pxz -= s;
-    a = ld(17); b = ld(18); s = a + b; d = a - b;             // ±(0,1,-1)
-    g.drho += s; g.jy += d; g.jz -= d; g.pyy += s; g.pzz += s; m.pyz -= s;
-    m.drho += g.drho; m.jx += g.jx; m.jy += g.jy; m.jz += g.jz;
-    m.pxx += g.pxx; m.pyy += g.pyy; m.pzz += g.pzz;
-    return m;
-}
-
-// Tensor de tensiones de no equilibrio Π^neq_ab = Σ f̃ c_a c_b - (ρ-1) c_s² δ_ab - ρ u_a u_b.
-template <class V> struct Neq { V xx, yy, zz, xy, xz, yz; };
-
-// Π_ab de m viene en unidades de ALMACENAMIENTO (×Sc); el reescalado 1/Sc se pliega en FMAs.
-template <float Sc, class V>
-CFD_INLINE Neq<V> noneq(const Mom<V>& m, V drho, V rho, V ux, V uy, V uz) {
-    const V d3 = drho * V(1.0f / 3.0f);
-    const V rx = rho * ux, ry = rho * uy, rz = rho * uz;
-    Neq<V> q;
-    if constexpr (Sc == 1.0f) {
-        q.xx = vfnma(rx, ux, m.pxx - d3);
-        q.yy = vfnma(ry, uy, m.pyy - d3);
-        q.zz = vfnma(rz, uz, m.pzz - d3);
-        q.xy = vfnma(rx, uy, m.pxy);
-        q.xz = vfnma(rx, uz, m.pxz);
-        q.yz = vfnma(ry, uz, m.pyz);
-    } else {
-        const V is(1.0f / Sc);
-        q.xx = vfnma(rx, ux, vfma(m.pxx, is, V(0.0f) - d3));
-        q.yy = vfnma(ry, uy, vfma(m.pyy, is, V(0.0f) - d3));
-        q.zz = vfnma(rz, uz, vfma(m.pzz, is, V(0.0f) - d3));
-        q.xy = vfnma(rx, uy, m.pxy * is);
-        q.xz = vfnma(rx, uz, m.pxz * is);
-        q.yz = vfnma(ry, uz, m.pyz * is);
-    }
-    return q;
-}
-
-// Smagorinsky (Hou et al. 1996): τ = ½(τ0 + sqrt(τ0² + 18√2 C_s² |Π^neq|/ρ)).
-// Devuelve 1 - ω = 1 - 2/(τ0 + sqrt(...)) con UNA sola división. K = 18√2 C_s² (0 → τ = τ0).
-template <class V>
-CFD_INLINE V one_minus_omega(const Neq<V>& q, V inv_rho, V tau0, V tau0sq, V K) {
-    // |Π|² en árbol (profundidad 3 en vez de 7 operaciones encadenadas).
-    const V dxy = vfma(q.xx, q.xx, q.yy * q.yy);
-    const V dz = vfma(q.zz, q.zz, V(2.0f) * (q.xy * q.xy));
-    const V oo = V(2.0f) * vfma(q.xz, q.xz, q.yz * q.yz);
-    const V qq = (dxy + dz) + oo;
-    const V den = tau0 + vsqrt(vfma(K * vsqrt(qq), inv_rho, tau0sq));
-    return V(1.0f) - V(2.0f) / den;
-}
-
-// Ley de pared de equilibrio (Werner & Wengle 1991) en la primera celda de fluido (a y = ½ de la pared):
-//   u⁺ = 8.3·(y⁺)^{1/7}  →  u_τ = (|u| / (8.3·(y/ν_w)^{1/7}))^{7/8}
-//   la tensión τ_w = ρu_τ² la transmite la celda si ν_ef·|u|/y = u_τ²  →  ν_ef = C·|u|^{3/4},
-//   C = y·(8.3·(y/ν_w)^{1/7})^{-7/4} (constante por paso: C3 = 3C).
-//   τ = max(3ν_ef + ½, τ0(x)): ν_ef ≥ ν → subcapa viscosa lineal (y⁺ < 11.8) y esponja respetadas.
-// |u|^{3/4} con 3 raíces (vsqrtps): s1 = |u|, s2 = |u|^{1/2}, √(s1·s2) = |u|^{3/4}.
-CFD_INLINE float vmax(float a, float b) { return a > b ? a : b; }
-CFD_INLINE f8 vmax(f8 a, f8 b) { return simd::max(a, b); }
-// Suelo de estabilidad: τ ≥ ½ + f·(τ_LES − ½), una fracción f de la viscosidad turbulenta de Smagorinsky
-// (omc_s = 1 − 1/τ_LES de la celda). Sin él la celda junto a la pared queda con τ − ½ ~ 10⁻⁴ y diverge en
-// huecos de 1-2 celdas (bajo el fondo, junto a las ruedas).
-template <class V>
-CFD_INLINE V wall_omc(V u2, V tau0, V C3, V omc_s, V ff) {
-    const V s1 = vsqrt(u2);
-    const V s2 = vsqrt(s1);
-    const V u34 = vsqrt(s1 * s2);
-    const V tw = vmax(vfma(C3, u34, V(0.5f)), tau0);
-    const V ts = V(1.0f) / (V(1.0f) - omc_s);
-    const V tf = vfma(ff, ts - V(0.5f), V(0.5f));
-    return V(1.0f) - V(1.0f) / vmax(tw, tf);
-}
-// C3 = 3·C de la ley de pared para la viscosidad ν_w (red).
-inline float wall_c3(float nu_w) {
-    const float A = 8.3f * std::pow(kWallY / std::max(nu_w, 1e-9f), 1.0f / 7.0f);
-    return 3.0f * kWallY * std::pow(A, -1.75f);
-}
-
-// Colisión + escritura por pares: st(k, v) guarda la población post-colisión k.
-//   Equilibrio desplazado: f̃eq = w (ρ-1 + ρ(a + a²/2 - 3u²/2)),  a = 3 c·u.
-//   BGK:         f̃* = f̃eq + (1-ω)(f̃ - f̃eq)          (ld(k) relee f̃_k: línea aún en L1)
-//   Regularizado: f̃* = f̃eq + (1-ω)·w·4.5·(c_a c_b - δ/3)Π^neq_ab  (proyección Hermite de 2º orden)
-// Con (1-ω) = 0 el resultado es EXACTAMENTE f̃eq (fronteras de equilibrio).
-// Sc = escala de almacenamiento (1 en FP32, 2^15 en FP16S): se pliega en los pesos → 0 mul extra.
-// ORDEN: en cada par se leen f_i y f_{i+1} ANTES de escribir, porque st(i) pisa la posición de
-// la que se leyó f_{i+1} (y viceversa).
-template <Collision C, float Sc, bool Bulk, class V, class Ld, class St>
-CFD_INLINE void collide(const Ld& ld, const St& st, V drho, V rho, V ux, V uy, V uz, const Neq<V>& q, V omc, V omcb, V om3) {
-    const V ux3 = V(3.0f) * ux, uy3 = V(3.0f) * uy, uz3 = V(3.0f) * uz;
-    const V c3 = V(0.0f) - vfma(ux3, ux, vfma(uy3, uy, uz3 * uz));   // -3u²
-    const V hr = V(0.5f) * rho;
-    // Pesos (×Sc) plegados en ρ, ρ/2 y ρ-1 por clase de peso (ejes / diagonales), estilo FluidX3D:
-    // f̃eq± = W(ρ-1) + (Wρ/2)(a² - 3u²) ± (Wρ) a   →  5 operaciones por par (antes 7).
-    constexpr float W0 = L::w[0] * Sc, W1 = L::w[1] * Sc, W2 = L::w[7] * Sc;
-    const V r1 = V(W1) * rho, h1 = V(W1) * hr, d1 = V(W1) * drho;
-    const V r2 = V(W2) * rho, h2 = V(W2) * hr, d2 = V(W2) * drho;
-    if constexpr (C != Collision::BGK) {
-        // post = f̃eq + (1-ω)·[W·4.5·(c c - δ/3):Π^neq]. La proyección NO depende de ω → se calcula en
-        // paralelo con la cadena larga de Smagorinsky (2 sqrt + div) y (1-ω) entra con UNA FMA final
-        // por dirección: la ruta crítica tras ω pasa de ~6 operaciones a 1.
-        const V mxx = V(4.5f) * q.xx, myy = V(4.5f) * q.yy, mzz = V(4.5f) * q.zz;
-        const V mxy = V(9.0f) * q.xy, mxz = V(9.0f) * q.xz, myz = V(9.0f) * q.yz;
-        // Traza (parte de VOLUMEN) separada de la desviadora: 4.5·Q_i:Π = 4.5·Q_i:Π_dev + trm·(|c_i|² − 1) con
-        // trm = 1.5·tr Π. Ejes (|c|² = 1): sólo desviadora; diagonales (|c|² = 2): + trm; reposo: − trm. La traza se
-        // relaja con (1 − ω_b) (omcb; = omc sin viscosidad de volumen propia) y se pliega en el término constante de
-        // cada clase de peso → 1 FMA por celda en vez de 1 por dirección.
-        const V trm = (mxx + myy + mzz) * V(1.0f / 3.0f);
-        const V rx = mxx - trm, ry = myy - trm, rz = mzz - trm;
-        // Con Bulk (plantilla) omcb es una constante del paso: la traza NO depende de la cadena de Smagorinsky y no
-        // alarga la ruta crítica (llvm-mca: con una mezcla en tiempo de ejecución, +15 % de ciclos por bloque).
-        const V tb = (Bulk ? omcb : omc) * trm;
-        const V d2b = vfma(V(W2), tb, d2);
-        st(0, vfnma(V(W0), tb, V(W0) * vfma(hr, c3, drho)));
-        const V rxy = rx + ry, rxz = rx + rz, ryz = ry + rz;
-        if constexpr (C == Collision::Regularized) {
-            auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW) {
-                const V t = vfma(hW, vfma(a, a, c3), dW);
-                const V ra = rW * a;
-                const V pr = V(W) * R;
-                st(i, vfma(omc, pr, t + ra));
-                st(i + 1, vfma(omc, pr, t - ra));
-            };
-            pair(1, ux3, rx, W1, r1, h1, d1);
-            pair(3, uy3, ry, W1, r1, h1, d1);
-            pair(5, uz3, rz, W1, r1, h1, d1);
-            pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2b);
-            pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2b);
-            pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2b);
-            pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2b);
-            pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2b);
-            pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2b);
-        } else {
-            // REGULARIZACIÓN RECURSIVA (Malaspinas 2015; Coreixas et al., PRE 96, 033306, 2017): el no equilibrio de
-            // 3er orden se reconstruye de Π^neq, a3neq_αβγ = u_α Π_βγ + u_β Π_αγ + u_γ Π_αβ, proyectado sobre las 6
-            // combinaciones de polinomios de Hermite de 3er orden que D3Q19 soporta (normas de la red 2/27 la suma y
-            // 6/27 la diferencia → coeficientes 1/(2c_s⁶) y 1/(6c_s⁶)). Por dirección queda un término IMPAR en c:
-            //   ejes ±x: ∓9w(a_xyy + a_xzz) (y cíclicos);  diagonales (c_x, c_y, 0): 9w(c_y a_xxy + c_x a_xyy) (y cíclicos).
-            // Se relaja con la ω de la cortante. Con la proyección de 2º orden esos momentos quedan libres (se ponen a 0
-            // cada paso) y a ν → 0 con Ma ≈ 0.16 el esquema es LINEALMENTE INESTABLE: un túnel VACÍO se llenaba de ruido
-            // de ±40 % de u∞ (docs/FISICA.md §1.5). El equilibrio sigue siendo de 2º orden: su término de 3er orden
-            // (ρuuu) se probó y no aporta estabilidad (medido), y cuesta ~15 operaciones más por celda.
-            // Forma "par ± impar": E = f̃eq_par + (1−ω)·Π-término, O = f̃eq_impar + (1−ω)·a3neq-término; st = E ± O.
-            // llvm-mca (Golden Cove, ciclos por bloque de 8, FP16S / FP32): proyección de 2º orden 129 / 107; esta forma
-            // 131 / 123; con el término sumado a ra (forma de la proyección) 148 / 121; recalculando a3neq de m_αβ por
-            // par (menos valores vivos, pensado para la iGPU) 135-137 / 123-132 → se queda esta (también en la iGPU,
-            // donde las tres dan el mismo tiempo: docs/opt/gpu.md).
-            const V ux2 = ux + ux, uy2 = uy + uy, uz2 = uz + uz;
-            const V k9 = V(9.0f * W2);   // 9·w_diag (con la escala de almacenamiento); ejes: 9·w_eje = 2·(9·w_diag)
-            const V nxxy = k9 * vfma(ux2, q.xy, uy * q.xx), nxyy = k9 * vfma(uy2, q.xy, ux * q.yy);
-            const V nxzz = k9 * vfma(uz2, q.xz, ux * q.zz), nxxz = k9 * vfma(ux2, q.xz, uz * q.xx);
-            const V nyzz = k9 * vfma(uz2, q.yz, uy * q.zz), nyyz = k9 * vfma(uy2, q.yz, uz * q.yy);
-            auto pair = [&](int i, V a, V R, float W, V rW, V hW, V dW, V p3) {
-                const V t = vfma(hW, vfma(a, a, c3), dW);
-                const V ra = rW * a;
-                const V pr = V(W) * R;
-                const V E = vfma(omc, pr, t);
-                const V O = vfma(om3, p3, ra);
-                st(i, E + O);
-                st(i + 1, E - O);
-            };
-            const V m2 = V(-2.0f);
-            pair(1, ux3, rx, W1, r1, h1, d1, m2 * (nxyy + nxzz));
-            pair(3, uy3, ry, W1, r1, h1, d1, m2 * (nxxy + nyzz));
-            pair(5, uz3, rz, W1, r1, h1, d1, m2 * (nyyz + nxxz));
-            pair(7, ux3 + uy3, rxy + mxy, W2, r2, h2, d2b, nxxy + nxyy);
-            pair(9, ux3 + uz3, rxz + mxz, W2, r2, h2, d2b, nxzz + nxxz);
-            pair(11, uy3 + uz3, ryz + myz, W2, r2, h2, d2b, nyzz + nyyz);
-            pair(13, ux3 - uy3, rxy - mxy, W2, r2, h2, d2b, nxyy - nxxy);
-            pair(15, ux3 - uz3, rxz - mxz, W2, r2, h2, d2b, nxzz - nxxz);
-            pair(17, uy3 - uz3, ryz - myz, W2, r2, h2, d2b, nyzz - nyyz);
-        }
-    } else {
-        (void)omcb; (void)om3;   // BGK: la traza se relaja con ω (sin viscosidad de volumen propia)
-        auto pair = [&](int i, V a, V rW, V hW, V dW) {
-            const V fi = ld(i), fj = ld(i + 1);
-            const V t = vfma(hW, vfma(a, a, c3), dW);
-            const V ra = rW * a;
-            const V e1 = t + ra, e2 = t - ra;
-            st(i, vfma(omc, fi - e1, e1));
-            st(i + 1, vfma(omc, fj - e2, e2));
-        };
-        {
-            const V f0 = ld(0);
-            const V e0 = V(W0) * vfma(hr, c3, drho);
-            st(0, vfma(omc, f0 - e0, e0));
-        }
-        pair(1, ux3, r1, h1, d1);
-        pair(3, uy3, r1, h1, d1);
-        pair(5, uz3, r1, h1, d1);
-        pair(7, ux3 + uy3, r2, h2, d2);
-        pair(9, ux3 + uz3, r2, h2, d2);
-        pair(11, uy3 + uz3, r2, h2, d2);
-        pair(13, ux3 - uy3, r2, h2, d2);
-        pair(15, ux3 - uz3, r2, h2, d2);
-        pair(17, uy3 - uz3, r2, h2, d2);
-    }
-}
 
 // ---- Contexto de un paso (todo lo que lee el kernel; constante durante el paso) -------------
 struct alignas(64) KCtx {
@@ -370,12 +71,10 @@ struct alignas(64) KCtx {
     bool pair;                // procesar pares de bloques puros entrelazados (16 celdas)
     bool ftz;                 // activar FTZ|DAZ durante el kernel
     bool mexp;                // paredes móviles ≠ suelo con rebote interpolado explícito (sin Ladd en el kernel)
+    float* tap;               // (refinamiento) salida de los bloques kBlkTap (kTapFloats por bloque), o nullptr
+    const u32* tapidx;        // (refinamiento) bloque → ranura en tap
     int pf;                   // distancia de prefetch (bloques), 0 = off
 };
-
-template <Precision P> struct Store;
-template <> struct Store<Precision::FP32> { using T = float; };
-template <> struct Store<Precision::FP16S> { using T = u16; };
 
 CFD_INLINE void store_macro(const KCtx& k, i64 n0, f8 r, f8 x, f8 y, f8 z) {
     if (k.nt) {
@@ -385,11 +84,11 @@ CFD_INLINE void store_macro(const KCtx& k, i64 n0, f8 r, f8 x, f8 y, f8 z) {
     }
 }
 
-// ---- Ruta AVX2: 8 celdas contiguas en x ------------------------------------------------------
-template <Precision P> inline constexpr float kSc = P == Precision::FP32 ? 1.0f : kScale;
 
+
+// ---- Ruta AVX2: 8 celdas contiguas en x ------------------------------------------------------
 template <Precision P, Collision C, bool Macro, bool Bulk, bool Masked, bool Ground = false, bool Wall = false>
-CFD_INLINE void block_vec(const KCtx& k, i64 n0, int x0, __m256& bad, __m256 m3) {
+CFD_INLINE void block_vec(const KCtx& k, i64 n0, int x0, __m256& bad, __m256 m3, float* tp) {
     using T = typename Store<P>::T;
     // Cinta móvil (sólo clase Ground): δ = 6 w_9 u_g en unidades de almacenamiento, en los carriles kGroundOnly.
     __m256 gdelta = _mm256_setzero_ps(), mg = _mm256_setzero_ps();
@@ -445,6 +144,12 @@ CFD_INLINE void block_vec(const KCtx& k, i64 n0, int x0, __m256& bad, __m256 m3)
         drho = _mm256_andnot_ps(meq, drho);
     }
     const Neq<f8> q = noneq<kSc<P>>(m, drho, rho, ux, uy, uz);
+    // (refinamiento) Bloque "tap": momentos pre-colisión de sus 8 celdas para la restricción hacia el padre (sólo en los
+    // bloques junto a la interfaz de una rejilla fina; en la red uniforme tp es siempre nullptr: rama predicha).
+    if (CFD_UNLIKELY(tp != nullptr)) {
+        rho.store(tp); ux.store(tp + 8); uy.store(tp + 16); uz.store(tp + 24);
+        q.xx.store(tp + 32); q.yy.store(tp + 40); q.zz.store(tp + 48); q.xy.store(tp + 56); q.xz.store(tp + 64); q.yz.store(tp + 72);
+    }
     // Rama uniforme en todo el paso (predicción perfecta): sin LES, 1-ω sale de tabla por plano x.
     f8 omc = k.K > 0.0f ? one_minus_omega(q, inv, f8::load(k.tau0 + x0), f8::load(k.tau0sq + x0), f8(k.K))
                         : f8::load(k.omc0 + x0);
@@ -539,19 +244,6 @@ CFD_INLINE void block_vec2(const KCtx& k, i64 n0, int x0, __m256& bad) {
     collide<C, kSc<P>, Bulk>(ld, st, drho, rho, ux, uy, uz, q, omc, f8x2(k.omcb), omc);
 }
 
-// ---- Ruta escalar (bloques con paredes móviles cerca; poco frecuente) ------------------------
-// Carga/escritura escalar en unidades de ALMACENAMIENTO (FP16S: f̃·2^15, sin reescalar).
-template <Precision P>
-CFD_INLINE float load_s(const void* p, i64 n) {
-    if constexpr (P == Precision::FP32) return static_cast<const float*>(p)[n];
-    else return f16_to_f32(static_cast<const u16*>(p)[n]);
-}
-template <Precision P>
-CFD_INLINE void store_s(void* p, i64 n, float v) {
-    if constexpr (P == Precision::FP32) static_cast<float*>(p)[n] = v;
-    else static_cast<u16*>(p)[n] = f32_to_f16(v);
-}
-
 CFD_INLINE void macro_solid(const KCtx& k, i64 n, u8 fl, int x, int y, int z) {
     Vec3 u{0, 0, 0};
     if (fl & kMoving) u = wall_velocity(k.motion[k.sid[n]], float(x), float(y), float(z));
@@ -559,7 +251,7 @@ CFD_INLINE void macro_solid(const KCtx& k, i64 n, u8 fl, int x, int y, int z) {
 }
 
 template <Precision P, Collision C, bool Macro, bool Bulk>
-CFD_NOINLINE u32 block_scalar(const KCtx& k, i64 n0, int x0, int y, int z) {
+CFD_NOINLINE u32 block_scalar(const KCtx& k, i64 n0, int x0, int y, int z, float* tp) {
     u32 bad = 0;
     float pux = 0.0f, puy = 0.0f, puz = 0.0f;   // u (pre-colisión) de la celda x-1
     for (int l = 0; l < 8; ++l) {
@@ -619,6 +311,10 @@ CFD_NOINLINE u32 block_scalar(const KCtx& k, i64 n0, int x0, int y, int z) {
         if (eq) { rho = 1.0f; drho = 0.0f; }
         pux = cux; puy = cuy; puz = cuz;
         const Neq<float> q = noneq<kSc<P>>(m, drho, rho, ux, uy, uz);
+        if (tp) {
+            tp[l] = rho; tp[8 + l] = ux; tp[16 + l] = uy; tp[24 + l] = uz;
+            tp[32 + l] = q.xx; tp[40 + l] = q.yy; tp[48 + l] = q.zz; tp[56 + l] = q.xy; tp[64 + l] = q.xz; tp[72 + l] = q.yz;
+        }
         float omc = k.K > 0.0f ? one_minus_omega(q, inv, k.tau0[x], k.tau0sq[x], k.K) : k.omc0[x];
         if (fl & kNearWall) {
             // Ley de pared: velocidad relativa a la media de las paredes MÓVILES vecinas (0 si todas fijas).
@@ -672,14 +368,15 @@ CFD_HOT void rows_kernel(const KCtx& k, i64 r0, i64 r1) {
             }
             const u8 c = cls[b];
             const __m256 m3 = (c & kBlkLayer) ? _mm256_setzero_ps() : _mm256_castsi256_ps(_mm256_set1_epi32(-1));
-            switch (c & ~kBlkLayer) {
-            case kBlkPure: block_vec<P, C, Macro, Bulk, false>(k, n0, x0, bad, m3); break;
-            case kBlkMasked: block_vec<P, C, Macro, Bulk, true>(k, n0, x0, bad, m3); break;
-            case kBlkGround: block_vec<P, C, Macro, Bulk, true, true>(k, n0, x0, bad, m3); break;
-            case kBlkPure | kBlkWall: block_vec<P, C, Macro, Bulk, false, false, true>(k, n0, x0, bad, m3); break;
-            case kBlkMasked | kBlkWall: block_vec<P, C, Macro, Bulk, true, false, true>(k, n0, x0, bad, m3); break;
-            case kBlkGround | kBlkWall: block_vec<P, C, Macro, Bulk, true, true, true>(k, n0, x0, bad, m3); break;
-            case kBlkScalar: badflag |= block_scalar<P, C, Macro, Bulk>(k, n0, x0, y, z); break;
+            float* const tp = (c & kBlkTap) ? k.tap + static_cast<i64>(k.tapidx[row * k.nbx + b]) * kTapFloats : nullptr;
+            switch (c & ~(kBlkLayer | kBlkTap)) {
+            case kBlkPure: block_vec<P, C, Macro, Bulk, false>(k, n0, x0, bad, m3, tp); break;
+            case kBlkMasked: block_vec<P, C, Macro, Bulk, true>(k, n0, x0, bad, m3, tp); break;
+            case kBlkGround: block_vec<P, C, Macro, Bulk, true, true>(k, n0, x0, bad, m3, tp); break;
+            case kBlkPure | kBlkWall: block_vec<P, C, Macro, Bulk, false, false, true>(k, n0, x0, bad, m3, tp); break;
+            case kBlkMasked | kBlkWall: block_vec<P, C, Macro, Bulk, true, false, true>(k, n0, x0, bad, m3, tp); break;
+            case kBlkGround | kBlkWall: block_vec<P, C, Macro, Bulk, true, true, true>(k, n0, x0, bad, m3, tp); break;
+            case kBlkScalar: badflag |= block_scalar<P, C, Macro, Bulk>(k, n0, x0, y, z, tp); break;
             default:
                 if constexpr (Macro) block_skip_macro(k, n0, x0, y, z);
                 break;
@@ -703,149 +400,9 @@ constexpr RowsFn pick_rows(bool macro, bool bulk) {
     else return macro ? &rows_kernel<P, C, true, false> : &rows_kernel<P, C, false, false>;
 }
 
-// ---- Fuerzas por intercambio de momento --------------------------------------------------------
-// Lista compacta de sólidos con vecinos fluidos: máscara de enlaces (bit k = el fluido está en s - c_k)
-// + id en los bits 24..31. Ordenada por (id, n) → cada trozo acumula corridas de un mismo id.
-// Nodo de fluido "verdadero" (ni sólido ni frontera de equilibrio) con algún vecino sólido: sus enlaces
-// de rebote n → s = n + c_k (bit k de mask). Lista compacta ordenada por n (acceso a memoria creciente).
-// (fase 3) El nodo de pared es público (lbm::WallNode, solver.hpp) para que el backend GPU reutilice este
-// preprocesado; mismos campos que la versión interna anterior.
-using WNode = WallNode;
-constexpr u8 kQHalf = 127;
-// Acumulador de fuerza/momento por id y trozo (reducción determinista).
-struct FAcc { double f[3], m[3]; };
-constexpr int kMaxForceChunks = 256;
-// Tablas float (evitan cvtsi2ss por enlace en la pasada de fuerzas).
-struct DirTabF { float c[L::Q][3]; float w2[L::Q]; float w6[L::Q]; float rinv[L::Q]; };
-constexpr DirTabF make_dirtab() {
-    DirTabF t{};
-    for (int k = 0; k < L::Q; ++k) {
-        int n2 = 0;
-        for (int a = 0; a < 3; ++a) { t.c[k][a] = static_cast<float>(L::c[k][a]); n2 += L::c[k][a] * L::c[k][a]; }
-        t.w2[k] = 2.0f * L::w[k];
-        t.w6[k] = 6.0f * L::w[k];
-        t.rinv[k] = n2 == 0 ? 0.0f : (n2 == 1 ? 1.0f : 0.70710678f);   // 1/|c_k|
-    }
-    return t;
-}
-constexpr DirTabF kDir = make_dirtab();
-
 } // namespace
 
 // ================================================================================================
-struct Solver::Impl {
-    Config cfg;
-    Tuning tun;
-    int nx = 0, ny = 0, nz = 0, nbx = 0;
-    i64 N = 0, nxny = 0, S = 0, P = 0;       // celdas, zancada por dirección, relleno
-    i64 off[L::Q] = {};
-    Buffer<u8> ddf;                          // 19·S elementos de float o u16
-    Buffer<u8> flags, flags_old, sid, user_sid, cls;
-    Buffer<float> rho, ux, uy, uz;
-    Buffer<float> tau0, tau0sq, omc0;
-    Buffer<u32> rows_all, rows_active;
-    i64 n_rows_active = 0;
-    std::vector<WNode> wnodes;               // nodos junto a paredes (rebote, fuerzas, modelo de pared)
-    WallSdf sdf;                             // distancia a la superficie real (rebote interpolado)
-    Buffer<FAcc> facc;                       // kMaxForceChunks × 256 acumuladores
-    Buffer<u8> ftouch;                       // kMaxForceChunks × 256: id tocado en el trozo
-    WallMotion user_motion[256];
-    bool user_moving[256] = {};
-    Motion motion_now[256];
-    Vec3 moment_ref{0, 0, 0};
-    ForceSample fs, fs_mean;
-    double acc_f[256][3] = {}, acc_m[256][3] = {};
-    u64 t = 0;
-    float u_from = 0, u_to = 0;
-    u64 ramp_t0 = 0;
-    double mlups = 0, t_kernel = 0, t_force = 0;
-    std::atomic<u32> bad{0};
-    // (fase 3) Backend externo: sincronización previa a leer/modificar el estado y campos macro sustitutos.
-    u64 revision = 1;
-    ExternalSync ext = nullptr;
-    void* ext_ctx = nullptr;
-    const float* ov[4] = {nullptr, nullptr, nullptr, nullptr};
-    void sync_ext() const { if (ext) ext(ext_ctx); }
-
-    usize esize() const { return cfg.precision == Precision::FP32 ? 4 : 2; }
-    void* dir_base(int k) { return ddf.data() + static_cast<usize>((static_cast<i64>(k) * S + P)) * esize(); }
-    const void* dir_base(int k) const { return ddf.data() + static_cast<usize>((static_cast<i64>(k) * S + P)) * esize(); }
-
-    float u_at(u64 step) const {
-        if (cfg.ramp_steps <= 0 || step >= ramp_t0 + static_cast<u64>(cfg.ramp_steps)) return u_to;
-        const float s = smoothstep(0.0f, static_cast<float>(cfg.ramp_steps), static_cast<float>(step - ramp_t0));
-        return u_from + (u_to - u_from) * s;
-    }
-
-    // Punteros de carga/escritura por paridad.
-    void step_ptrs(u64 step, const void* ld[L::Q], void* st[L::Q]) const {
-        const int p = static_cast<int>(step & 1);
-        const usize es = esize();
-        auto base = [&](int k, i64 o) -> const u8* {
-            return ddf.data() + static_cast<usize>(static_cast<i64>(k) * S + P + o) * es;
-        };
-        ld[0] = base(0, 0);
-        for (int i = 1; i < L::Q; i += 2) {
-            ld[i] = p ? base(i, 0) : base(i + 1, 0);
-            ld[i + 1] = p ? base(i + 1, off[i]) : base(i, off[i]);
-        }
-        st[0] = const_cast<void*>(ld[0]);
-        for (int i = 1; i < L::Q; i += 2) {
-            st[i] = const_cast<void*>(ld[i + 1]);
-            st[i + 1] = const_cast<void*>(ld[i]);
-        }
-    }
-
-    void build_tau() {
-        ++revision;
-        const float nu = std::max(cfg.nu, 1e-7f);
-        const int xs = static_cast<int>(static_cast<float>(nx) * (1.0f - std::clamp(cfg.sponge_frac, 0.0f, 0.9f)));
-        const float nu_max = std::max(nu, kSpongeNu);
-        for (int x = 0; x < nx; ++x) {
-            float v = nu;
-            if (cfg.sponge_frac > 0.0f && x > xs && nx - 1 > xs) {
-                const float s = smoothstep(static_cast<float>(xs), static_cast<float>(nx - 1), static_cast<float>(x));
-                v = nu + (nu_max - nu) * s * s;
-            }
-            tau0[x] = 3.0f * v + 0.5f;
-            tau0sq[x] = tau0[x] * tau0[x];
-            omc0[x] = 1.0f - 2.0f / (tau0[x] + tau0[x]);   // misma expresión que con K=0 en one_minus_omega
-        }
-    }
-
-    void update_motion_table() { fill_motion(t, motion_now); }
-    void fill_motion(u64 step, Motion* dst) const {
-        // Las velocidades de pared se dan a la u∞ objetivo: durante la rampa se escalan con u(t)/u∞.
-        // Rampa hacia 0 (parar el túnel): se escalan respecto a la velocidad de partida → paran también.
-        const float uc = u_at(step);
-        const float r = u_to != 0.0f ? uc / u_to : (u_from != 0.0f ? uc / u_from : 1.0f);
-        const Vec3 vg = cfg.ground == GroundMode::Moving ? Vec3(uc, 0, 0) : Vec3(0, 0, 0);
-        for (int id = 0; id < 255; ++id) {
-            const WallMotion& m = user_motion[id];
-            dst[id].v = m.v * r;
-            dst[id].omega = m.omega * r;
-            dst[id].center = m.center;
-            dst[id].contact_z = m.contact_z;
-            dst[id].vc = vg;
-            dst[id].conserve = m.impermeable;
-        }
-        dst[255] = Motion{};
-        dst[255].v = vg;
-    }
-
-    bool id_moving(int id) const {
-        if (id == k_ground_id) return cfg.ground == GroundMode::Moving;
-        return user_moving[id];
-    }
-
-    void reset_fill();
-    void rebuild(bool transitions);
-    void run_kernel(bool macro);
-    void compute_wall_geometry();
-    // Rebote explícito (+ fuerzas) tras el paso `tt` (el que dejó en memoria su post-colisión). write_only:
-    // sólo escribe las poblaciones entrantes (arranque / tras cambiar la geometría), sin fuerzas.
-    void boundary_pass(bool accumulate, u64 tt, bool write_only = false);
-};
 
 // ---- Relleno uniforme (reset): f̃ = feq(ρ=1, u0 x̂) - w en la semántica de ranura de la paridad 0.
 void Solver::Impl::reset_fill() {
@@ -905,11 +462,21 @@ void Solver::Impl::rebuild(bool transitions) {
                         s = k_ground_id;
                         fl = kSolid | (moving_id[k_ground_id] ? kMoving : 0);
                     } else if (x == 0 || x == nx - 1 || y == 0 || y == ny - 1 || z == 0 || z == nz - 1) {
-                        const bool far = (y == 0 || y == ny - 1 || z == 0 || z == nz - 1);
-                        fl = (x == nx - 1 && !far) ? kOutlet : kInlet;
+                        if (nested) {
+                            // (refinamiento) Rejilla fina: las caras son la capa FANTASMA (sólido con id 0: el kernel no
+                            // las procesa y la pasada de interfaz escribe su post-colisión) salvo los sólidos del usuario.
+                            s = U[n];
+                            fl = kSolid | (s && moving_id[s] ? kMoving : 0);
+                        } else {
+                            const bool far = (y == 0 || y == ny - 1 || z == 0 || z == nz - 1);
+                            fl = (x == nx - 1 && !far) ? kOutlet : kInlet;
+                        }
                     } else {
                         s = U[n];
                         if (s) fl = kSolid | (moving_id[s] ? kMoving : 0);
+                        // (refinamiento) Celda cubierta por una rejilla más fina: esclava (capa junto a la interfaz, la
+                        // escribe la restricción) o muerta (nadie la lee). Sólido con id 0 para el kernel y el contorno.
+                        else if (!cover.empty() && is_covered(x, y, static_cast<int>(z))) fl = kSolid;
                     }
                     F[n] = fl;
                     SI[n] = s;
@@ -947,7 +514,7 @@ void Solver::Impl::rebuild(bool transitions) {
                             for (int i = 1; i < L::Q; ++i) {
                                 const i64 m = n + off[i];
                                 if (F[m] & kMoving) (SI[m] == k_ground_id && m < nxny ? near_ground : near_other) = true;
-                                else if (F[m] & kSolid) near_static = true;
+                                else if ((F[m] & kSolid) && SI[m]) near_static = true;   // (id 0: fantasma/esclava, no es pared)
                             }
                             if (near_ground || near_other) F[n] |= kNearMoving;
                             if (near_ground && !near_other) F[n] |= kGroundOnly;
@@ -983,7 +550,7 @@ void Solver::Impl::rebuild(bool transitions) {
         const int Lw = cfg.rr_wall_layer;
         std::vector<u8> a(static_cast<usize>(N)), b(static_cast<usize>(N));
         parallel_for(0, N, 1 << 15, [&](i64 lo, i64 hi) {
-            for (i64 n = lo; n < hi; ++n) a[static_cast<usize>(n)] = (F[n] & kSolid) && !(SI[n] == k_ground_id && n < nxny);
+            for (i64 n = lo; n < hi; ++n) a[static_cast<usize>(n)] = (F[n] & kSolid) && SI[n] && !(SI[n] == k_ground_id && n < nxny);
         });
         // Máximo deslizante de radio Lw a lo largo de un eje (zancada st, longitud len): dst[j] = OR de src[j−Lw..j+Lw]
         // (distancia a la última celda marcada por delante y por detrás).
@@ -1006,6 +573,7 @@ void Solver::Impl::rebuild(bool transitions) {
         pass(a, b, 1, nx, static_cast<i64>(ny) * nz, [&](i64 l) { return l * NX; });
         pass(b, a, NX, ny, static_cast<i64>(nx) * nz, [&](i64 l) { return (l % NX) + (l / NX) * NX * NY; });
         pass(a, b, nxny, nz, nxny, [&](i64 l) { return l; });
+        u8* LY = lay.size() ? lay.data() : nullptr;   // (refinamiento) la capa también para fantasmas y esclavas
         parallel_for(0, N / 8, 1 << 12, [&](i64 lo, i64 hi) {
             for (i64 bl = lo; bl < hi; ++bl) {
                 bool any = false;
@@ -1013,8 +581,11 @@ void Solver::Impl::rebuild(bool transitions) {
                 if (any)
                     for (int l = 0; l < 8; ++l)
                         if (!(F[8 * bl + l] & kSolid)) F[8 * bl + l] |= kLayer;
+                if (LY) for (int l = 0; l < 8; ++l) LY[8 * bl + l] = any;
             }
         });
+    } else if (lay.size()) {
+        lay.zero();
     }
     // 4) Clases de bloque (SWAR sobre 8 flags) y filas activas.
     const i64 nblocks = N / 8;
@@ -1064,7 +635,8 @@ void Solver::Impl::rebuild(bool transitions) {
                     u16 kind = 0;
                     for (int k = 1; k < L::Q; ++k) {
                         const u8 fm = F[n + off[k]];
-                        if (fm & kSolid) { mask |= 1u << k; kind |= (fm & kMoving) ? 1 : 2; }
+                        // (id 0: fantasma / esclava del refinamiento: no es pared, la interfaz escribe sus poblaciones)
+                        if ((fm & kSolid) && SI[n + off[k]]) { mask |= 1u << k; kind |= (fm & kMoving) ? 1 : 2; }
                     }
                     if (!mask) continue;
                     WNode w{};
@@ -1081,6 +653,9 @@ void Solver::Impl::rebuild(bool transitions) {
     total = 0;
     for (auto& v : per_z) { std::copy(v.begin(), v.end(), wnodes.begin() + static_cast<i64>(total)); total += v.size(); }
     compute_wall_geometry();
+    if (!cover.empty()) build_fown();   // (refinamiento) qué enlaces de pared cuentan fuerza en esta rejilla
+    else fown.clear();
+    { Impl* r = this; while (r->par) r = r->par; r->iface_dirty = true; }
     // Poblaciones entrantes del rebote explícito para la NUEVA geometría a partir del post-colisión del
     // último paso (o del relleno, que equivale a un paso "−1" en equilibrio).
     // (v2) Con la velocidad de pared ACTUAL: las paredes móviles interpoladas también se escriben aquí.
@@ -1191,6 +766,11 @@ void Solver::Impl::compute_wall_geometry() {
                         res = std::max(res, std::fabs(w.fn(w.ctx, pn + e) - dn - ne));
                     }
                 nd.sgeo = std::clamp((0.4f - res) / 0.233f, 0.0f, 1.0f);
+                // Nodo prácticamente SOBRE la superficie (centro fluido a < 0.1 celdas de la pared engrosada: la voxelización
+                // lo dejó fluido por el umbral d ≥ 0.12·dx pero q ≈ 0 en todos sus enlaces): la pared "deslizante" quedaría en
+                // el propio nodo y realimenta su velocidad (medido: divergencia en el borde de salida del flap del F1 2022 con
+                // la rejilla de 14.4 mm, |u| 0.3 → 13 en 16 pasos, independiente de ν). Sin deslizamiento: rebote puro.
+                if (dn < 0.1f) nd.sgeo = 0.0f;
             }
         }
     });
@@ -1231,6 +811,8 @@ void Solver::Impl::run_kernel(bool macro) {
     k.pair = tun.pair_blocks > 0;
     k.ftz = tun.ftz > 0;   // medido: sin efecto (no hay subnormales en este kernel) → por defecto no se toca MXCSR
     k.mexp = cfg.bounce == BounceBack::Interpolated;
+    k.tap = tap.size() ? tap.data() : nullptr;
+    k.tapidx = tapidx.size() ? tapidx.data() : nullptr;
 
     RowsFn fn;
     const bool fp32 = cfg.precision == Precision::FP32;
@@ -1294,6 +876,7 @@ void Solver::Impl::boundary_pass(bool accumulate, u64 tt, bool write_only) {
     step_ptrs(tt + 1, ldn, stn);
     (void)ldc; (void)stn;
     const WNode* W = wnodes.data();
+    const u32* OWN = fown.empty() ? nullptr : fown.data();   // (refinamiento) enlaces cuya fuerza cuenta aquí
     const u8* F = flags.data();
     const u8* SI = sid.data();
     const Motion* mot = motion_now;
@@ -1346,7 +929,7 @@ void Solver::Impl::boundary_pass(bool accumulate, u64 tt, bool write_only) {
                     const float q = static_cast<float>(qc) * (1.0f / 254.0f);
                     const float A = g[k];
                     if (qc == kQHalf) v0[k] = A;
-                    else if (q < 0.5f && !(F[n - off[k]] & kSolid)) {
+                    else if (q < 0.5f && !((F[n - off[k]] & kSolid) && SI[n - off[k]])) {   // (fantasma/esclava: ya escrita)
                         const float C = ld(ldn[k], n);
                         v0[k] = vfma(2.0f * q, A - C, C);                      // 2q·A + (1-2q)·C
                     } else {
@@ -1519,6 +1102,7 @@ void Solver::Impl::boundary_pass(bool accumulate, u64 tt, bool write_only) {
                 // Wen et al. 2014: F = Σ c_k(f_out + f_in) - u_w Σ (f_out - f_in)  (0 en paredes fijas).
                 const float gx = gi * lg * uw.x, gy = gi * lg * uw.y, gz = gi * lg * uw.z;
                 const float fx = fv * cx - gx, fy = fv * cy - gy, fz = fv * cz - gz;
+                if (OWN && !((OWN[i] >> k) & 1u)) continue;   // pared dentro de una rejilla más fina: allí se cuenta
                 // Acumulación por nodo (float) y volcado por id: momento (x_n + c_k) × F_k = x_n × F_k + c_k × F_k y
                 // c_k × F_k = −c_k × (gi·lg·u_w) (c_k × c_k = 0): sólo los enlaces móviles aportan el segundo término.
                 if (static_cast<int>(id) != cur) { flush(); cur = static_cast<int>(id); }
@@ -1569,11 +1153,9 @@ void Solver::Impl::boundary_pass(bool accumulate, u64 tt, bool write_only) {
 Solver::Solver() : impl_(new Impl) {}
 Solver::~Solver() { delete impl_; }
 
-void Solver::init(const Config& cfg_in) {
-    Impl& I = *impl_;
-    I.sync_ext();
-    I.ov[0] = I.ov[1] = I.ov[2] = I.ov[3] = nullptr;   // el dominio cambia: los campos del backend dejan de valer
-    Config cfg = cfg_in;
+void Solver::Impl::setup(const Config& c) {
+    Impl& I = *this;
+    const Config& cfg = c;
     CFD_CHECK(cfg.nx >= 16 && cfg.ny >= 4 && cfg.nz >= 4, "lbm::Solver::init: dominio demasiado pequeño");
     CFD_CHECK(cfg.nx % 8 == 0, "lbm::Solver::init: nx debe ser múltiplo de 8");
     I.cfg = cfg;
@@ -1599,6 +1181,8 @@ void Solver::init(const Config& cfg_in) {
     I.user_sid.resize(n, true);
     I.cls.resize(n / 8, true);
     I.rho.resize(n); I.ux.resize(n); I.uy.resize(n); I.uz.resize(n);
+    if (I.refined()) { I.lay.resize(n, true); I.vflags.resize(n, true); I.vsid.resize(n, true); }
+    else { I.lay.release(); I.vflags.release(); I.vsid.release(); }
     I.tau0.resize(static_cast<usize>(cfg.nx) + 8);
     I.tau0sq.resize(static_cast<usize>(cfg.nx) + 8);
     I.omc0.resize(static_cast<usize>(cfg.nx) + 8);
@@ -1613,6 +1197,19 @@ void Solver::init(const Config& cfg_in) {
     I.t = 0;
     I.u_to = cfg.u_inf;
     I.rebuild(false);
+}
+
+void Solver::init(const Config& cfg_in) {
+    Impl& I = *impl_;
+    I.sync_ext();
+    I.ov[0] = I.ov[1] = I.ov[2] = I.ov[3] = nullptr;   // el dominio cambia: los campos del backend dejan de valer
+    Config cfg = cfg_in;
+    I.owned.clear();
+    I.kids.clear();
+    I.cover.clear();
+    if (cfg.n_boxes > 0) I.refine_plan(cfg);   // (refinamiento) normaliza las cajas y fija `cover` de cada rejilla
+    I.setup(cfg);
+    if (cfg.n_boxes > 0) I.refine_create();    // rejillas finas (cada una con su setup)
     reset_flow();
 }
 
@@ -1620,9 +1217,13 @@ const Config& Solver::config() const { return impl_->cfg; }
 
 void Solver::set_geometry(const u8* solid_id) { set_geometry(solid_id, WallSdf{}); }
 
-void Solver::set_geometry(const u8* solid_id, const WallSdf& sdf) {
-    Impl& I = *impl_;
-    I.sync_ext();
+void Solver::set_geometry(const u8* solid_id, const WallSdf& sdf) { set_grid_geometry(0, solid_id, sdf); }
+
+void Solver::set_grid_geometry(int g, const u8* solid_id, const WallSdf& sdf) {
+    Impl& R = *impl_;
+    CFD_CHECK(g >= 0 && g < R.n_grids(), "lbm::Solver::set_grid_geometry: rejilla inexistente");
+    Impl& I = R.grid(g);
+    R.sync_ext();
     if (solid_id) std::memcpy(I.user_sid.data(), solid_id, static_cast<usize>(I.N));
     else I.user_sid.zero();
     I.sdf = sdf;
@@ -1630,69 +1231,99 @@ void Solver::set_geometry(const u8* solid_id, const WallSdf& sdf) {
 }
 
 void Solver::set_wall_motion(u8 id, const WallMotion& m) {
-    Impl& I = *impl_;
+    Impl& R = *impl_;
     if (id == 0 || id == k_ground_id) return;
-    I.user_motion[id] = m;
     const bool mv = length2(m.v) + length2(m.omega) > 0.0f;
-    const bool changed = mv != I.user_moving[id];
-    if (changed) I.sync_ext();
-    I.user_moving[id] = mv;
-    if (changed) I.rebuild(true);
+    for (int g = 0; g < R.n_grids(); ++g) {
+        Impl& I = R.grid(g);
+        I.user_motion[id] = g == 0 ? m : I.to_grid(m);
+        const bool changed = mv != I.user_moving[id];
+        if (changed) R.sync_ext();
+        I.user_moving[id] = mv;
+        if (changed) I.rebuild(true);
+    }
 }
 
 void Solver::clear_wall_motions() {
-    Impl& I = *impl_;
-    bool changed = false;
-    for (int id = 0; id < 256; ++id) changed |= I.user_moving[id];
-    if (changed) I.sync_ext();
-    for (int id = 0; id < 256; ++id) { I.user_motion[id] = WallMotion{}; I.user_moving[id] = false; }
-    if (changed) I.rebuild(true);
+    Impl& R = *impl_;
+    for (int g = 0; g < R.n_grids(); ++g) {
+        Impl& I = R.grid(g);
+        bool changed = false;
+        for (int id = 0; id < 256; ++id) changed |= I.user_moving[id];
+        if (changed) R.sync_ext();
+        for (int id = 0; id < 256; ++id) { I.user_motion[id] = WallMotion{}; I.user_moving[id] = false; }
+        if (changed) I.rebuild(true);
+    }
 }
 
 void Solver::set_ground(GroundMode g) {
-    Impl& I = *impl_;
-    if (g == I.cfg.ground) return;
-    I.sync_ext();
-    I.cfg.ground = g;
-    I.rebuild(true);
+    Impl& R = *impl_;
+    if (g == R.cfg.ground) return;
+    R.sync_ext();
+    for (int k = 0; k < R.n_grids(); ++k) {
+        Impl& I = R.grid(k);
+        if (k > 0 && !I.gattached) continue;   // las rejillas finas que no tocan el suelo no lo ven
+        I.cfg.ground = g;
+        I.rebuild(true);
+    }
 }
 
 void Solver::set_inflow(float u_inf) {
-    Impl& I = *impl_;
-    I.u_from = I.u_at(I.t);
-    I.u_to = u_inf;
-    I.ramp_t0 = I.t;
-    I.cfg.u_inf = u_inf;
+    Impl& R = *impl_;
+    for (int k = 0; k < R.n_grids(); ++k) {
+        Impl& I = R.grid(k);
+        I.u_from = I.u_at(I.t);
+        I.u_to = u_inf;
+        I.ramp_t0 = R.t * static_cast<u64>(I.nsub);   // misma rampa en tiempo físico (pasos de cada rejilla)
+        I.cfg.u_inf = u_inf;
+    }
 }
 
-void Solver::set_viscosity(float nu) { impl_->sync_ext(); impl_->cfg.nu = nu; impl_->build_tau(); }
-void Solver::set_wall_model(WallModel m, float wall_nu) {
-    Impl& I = *impl_;
-    I.cfg.wall_nu = std::max(wall_nu, 0.0f);
-    if (m == I.cfg.wall_model) return;
-    I.sync_ext();
-    I.cfg.wall_model = m;
-    I.rebuild(false);   // el bit kNearWall y las clases de bloque dependen del modelo
+void Solver::set_viscosity(float nu) {
+    Impl& R = *impl_;
+    R.sync_ext();
+    for (int k = 0; k < R.n_grids(); ++k) { Impl& I = R.grid(k); I.cfg.nu = nu * static_cast<float>(I.nsub); I.build_tau(); }
 }
-void Solver::set_smagorinsky(float cs) { impl_->cfg.cs_smag = std::max(cs, 0.0f); }
-void Solver::set_moment_reference(Vec3 cells) { impl_->moment_ref = cells; }
+void Solver::set_wall_model(WallModel m, float wall_nu) {
+    Impl& R = *impl_;
+    for (int k = 0; k < R.n_grids(); ++k) {
+        Impl& I = R.grid(k);
+        I.cfg.wall_nu = std::max(wall_nu, 0.0f) * static_cast<float>(I.nsub);   // ν de red ∝ dt/dx² → ×2 por nivel
+        if (m == I.cfg.wall_model) continue;
+        R.sync_ext();
+        I.cfg.wall_model = m;
+        I.rebuild(false);   // el bit kNearWall y las clases de bloque dependen del modelo
+    }
+}
+void Solver::set_smagorinsky(float cs) {
+    Impl& R = *impl_;
+    for (int k = 0; k < R.n_grids(); ++k) R.grid(k).cfg.cs_smag = std::max(cs, 0.0f);   // Δ = 1 celda de cada rejilla
+}
+void Solver::set_moment_reference(Vec3 cells) {
+    Impl& R = *impl_;
+    for (int k = 0; k < R.n_grids(); ++k) { Impl& I = R.grid(k); I.moment_ref = (cells - I.org) * (1.0f / I.scale); }
+}
 
 void Solver::reset_flow() {
-    Impl& I = *impl_;
-    I.sync_ext();
-    I.ov[0] = I.ov[1] = I.ov[2] = I.ov[3] = nullptr;   // reset_fill escribe los campos propios (los del backend quedan viejos)
-    I.t = 0;
-    I.ramp_t0 = 0;
-    I.u_to = I.cfg.u_inf;
-    I.u_from = I.cfg.ramp_steps > 0 ? 0.0f : I.cfg.u_inf;
-    I.bad.store(0);
-    I.fs = ForceSample{};
-    I.fs_mean = ForceSample{};
-    I.reset_fill();
-    // El relleno equivale al post-colisión de un paso "−1" en equilibrio: se escriben ya las poblaciones
-    // entrantes del rebote explícito (si no, el primer paso vería el valor full-way del relleno).
-    I.update_motion_table();
-    I.boundary_pass(false, I.t - 1, true);
+    Impl& R = *impl_;
+    R.sync_ext();
+    R.ov[0] = R.ov[1] = R.ov[2] = R.ov[3] = nullptr;   // reset_fill escribe los campos propios (los del backend quedan viejos)
+    for (int k = 0; k < R.n_grids(); ++k) {
+        Impl& I = R.grid(k);
+        I.t = 0;
+        I.ramp_t0 = 0;
+        I.u_to = I.cfg.u_inf;
+        I.u_from = I.cfg.ramp_steps > 0 ? 0.0f : I.cfg.u_inf;
+        I.bad.store(0);
+        I.fs = ForceSample{};
+        I.fs_mean = ForceSample{};
+        I.reset_fill();
+        // El relleno equivale al post-colisión de un paso "−1" en equilibrio: se escriben ya las poblaciones
+        // entrantes del rebote explícito (si no, el primer paso vería el valor full-way del relleno).
+        I.update_motion_table();
+        I.boundary_pass(false, I.t - 1, true);
+    }
+    if (!R.owned.empty()) R.iface_dirty = true;   // (refinamiento) M_T de las interfaces con el estado nuevo
 }
 
 void Solver::step(int n, bool update_macro) {
@@ -1701,6 +1332,48 @@ void Solver::step(int n, bool update_macro) {
     I.sync_ext();      // (fase 3) con un backend externo enganchado: poblaciones de la CPU al día
     ++I.revision;      // ... y las que resulten de este paso en la CPU invalidan las del backend
     const double t0 = now_sec();
+    if (!I.owned.empty()) {
+        // ---- Refinamiento local: cada paso de la red base avanza recursivamente las rejillas finas (lbm/refine.cpp).
+        if (I.iface_dirty) I.iface_build_all();
+        double cells = 0;
+        for (int g = 0; g < I.n_grids(); ++g) {
+            Impl& G = I.grid(g);
+            for (int id = 0; id < 256; ++id)
+                for (int a = 0; a < 3; ++a) { G.acc_f[id][a] = 0; G.acc_m[id][a] = 0; }
+            G.t_kernel = G.t_force = G.t_iface = 0;
+            cells += static_cast<double>(G.N) * G.nsub;
+        }
+        for (int s = 0; s < n; ++s) I.advance(update_macro && s == n - 1, 0.0f);
+        if (update_macro)
+            for (int g = I.n_grids() - 1; g >= 0; --g) if (!I.grid(g).cover.empty()) I.grid(g).fill_vis();   // de la más fina a la base
+        const double dt = now_sec() - t0;
+        I.mlups = dt > 0 ? cells * n / dt * 1e-6 : 0.0;   // MLUPS "equivalentes": todas las rejillas
+        // Fuerzas en unidades de la red base: F ∝ dx⁴/dt² = dx² (escalado acústico) → ×scale²; momentos ×scale³.
+        ForceSample last{}, mean{};
+        double tk = 0, tf = 0, ti = 0;
+        for (int g = 0; g < I.n_grids(); ++g) {
+            Impl& G = I.grid(g);
+            const double s2 = static_cast<double>(G.scale) * G.scale, s3 = s2 * G.scale;
+            const double inv = 1.0 / (static_cast<double>(n) * G.nsub);
+            for (int id = 0; id < 256; ++id) {
+                last.force[id] += G.fs.force[id] * static_cast<float>(s2);
+                last.moment[id] += G.fs.moment[id] * static_cast<float>(s3);
+                mean.force[id] += Vec3(float(G.acc_f[id][0] * inv * s2), float(G.acc_f[id][1] * inv * s2), float(G.acc_f[id][2] * inv * s2));
+                mean.moment[id] += Vec3(float(G.acc_m[id][0] * inv * s3), float(G.acc_m[id][1] * inv * s3), float(G.acc_m[id][2] * inv * s3));
+            }
+            tk += G.t_kernel; tf += G.t_force; ti += G.t_iface;
+            if (g > 0 && G.bad.load(std::memory_order_relaxed)) I.bad.store(1, std::memory_order_relaxed);
+        }
+        for (ForceSample* f : {&last, &mean}) {
+            Vec3 tf3{0, 0, 0}, tm3{0, 0, 0};
+            for (int id = 1; id <= 254; ++id) { tf3 += f->force[id]; tm3 += f->moment[id]; }
+            f->total = tf3; f->total_moment = tm3; f->step = I.t;
+        }
+        I.fs = last;
+        I.fs_mean = mean;
+        I.t_kernel = tk; I.t_force = tf; I.t_iface_total = ti;
+        return;
+    }
     double tk = 0, tf = 0;
     for (int id = 0; id < 256; ++id)
         for (int a = 0; a < 3; ++a) { I.acc_f[id][a] = 0; I.acc_m[id][a] = 0; }
@@ -1731,14 +1404,19 @@ void Solver::step(int n, bool update_macro) {
     I.fs_mean.step = I.t;
 }
 
-FieldView Solver::field() const {
-    const Impl& I = *impl_;
+FieldView Solver::field() const { return grid_field(0); }
+
+FieldView Solver::grid_field(int g) const {
+    const Impl& R = *impl_;
+    CFD_CHECK(g >= 0 && g < R.n_grids(), "lbm::Solver::grid_field: rejilla inexistente");
+    const Impl& I = R.grid(g);
     FieldView v;
     v.nx = I.nx; v.ny = I.ny; v.nz = I.nz;
     v.rho = I.rho.data(); v.ux = I.ux.data(); v.uy = I.uy.data(); v.uz = I.uz.data();
-    if (I.ov[0]) { v.rho = I.ov[0]; v.ux = I.ov[1]; v.uy = I.ov[2]; v.uz = I.ov[3]; }
-    v.flags = I.flags.data();
-    v.solid_id = I.sid.data();
+    if (g == 0 && I.ov[0]) { v.rho = I.ov[0]; v.ux = I.ov[1]; v.uy = I.ov[2]; v.uz = I.ov[3]; }
+    // (refinamiento) flags/ids de visualización: fantasmas como fluido, celdas cubiertas como sus hijas.
+    v.flags = I.vflags.size() ? I.vflags.data() : I.flags.data();
+    v.solid_id = I.vsid.size() ? I.vsid.data() : I.sid.data();
     v.u_inf = I.cfg.u_inf;
     return v;
 }
@@ -1749,20 +1427,33 @@ u64 Solver::steps() const { return impl_->t; }
 double Solver::last_mlups() const { return impl_->mlups; }
 double Solver::last_force_seconds() const { return impl_->t_force; }
 double Solver::last_kernel_seconds() const { return impl_->t_kernel; }
-bool Solver::diverged() const { return impl_->bad.load(std::memory_order_relaxed) != 0; }
+double Solver::last_iface_seconds() const { return impl_->t_iface_total; }
+bool Solver::diverged() const {
+    const Impl& R = *impl_;
+    for (int g = 0; g < R.n_grids(); ++g) if (R.grid(g).bad.load(std::memory_order_relaxed)) return true;
+    return false;
+}
 float Solver::current_u_inf() const { return impl_->u_at(impl_->t); }
-void Solver::set_tuning(const Tuning& t) { impl_->tun = t; }
+void Solver::set_tuning(const Tuning& t) { Impl& R = *impl_; for (int g = 0; g < R.n_grids(); ++g) R.grid(g).tun = t; }
 const Solver::Tuning& Solver::tuning() const { return impl_->tun; }
 
 usize Solver::memory_bytes() const {
-    const Impl& I = *impl_;
-    return I.ddf.size() + I.flags.size() * 4 + I.cls.size() + (I.rho.size() + I.ux.size() + I.uy.size() + I.uz.size()) * 4 +
-           I.wnodes.size() * sizeof(WNode) + I.facc.size() * sizeof(FAcc) + (I.rows_all.size() + I.rows_active.size()) * 4;
+    const Impl& R = *impl_;
+    usize total = 0;
+    for (int g = 0; g < R.n_grids(); ++g) {
+        const Impl& I = R.grid(g);
+        total += I.ddf.size() + I.flags.size() * 4 + I.cls.size() + (I.rho.size() + I.ux.size() + I.uy.size() + I.uz.size()) * 4 +
+                 I.wnodes.size() * sizeof(WNode) + I.facc.size() * sizeof(FAcc) + (I.rows_all.size() + I.rows_active.size()) * 4 +
+                 I.lay.size() + I.vflags.size() + I.vsid.size() + I.ghosts.size() * sizeof(IGhost) + I.rcells.size() * sizeof(IRcell) +
+                 I.mcells.size() * 4 + (I.Mprev.size() + I.Mnext.size() + I.Rst.size()) * 4 + I.fown.size() * 4;
+    }
+    return total;
 }
 
-double Solver::total_mass() const {
-    const Impl& I = *impl_;
-    I.sync_ext();
+// Masa de una rejilla (sus unidades): poblaciones de las celdas de fluido (sin fronteras ni fantasmas/esclavas) + las
+// que están "en vuelo" dentro de sólidos con el rebote implícito.
+double Solver::Impl::mass() const {
+    const Impl& I = *this;
     const void* ld[L::Q];
     void* st[L::Q];
     const void* ld_prev[L::Q];
@@ -1784,7 +1475,20 @@ double Solver::total_mass() const {
         // dentro de 2 pasos). Con el rebote interpolado la población entrante ya está escrita en ld (half-way).
         if (I.cfg.bounce == BounceBack::Implicit)
             for (int k = 1; k < L::Q; ++k)
-                if (F[n + I.off[k]] & kSolid) total += val(st_prev[k], n, k);
+                if ((F[n + I.off[k]] & kSolid) && I.sid[n + I.off[k]]) total += val(st_prev[k], n, k);
+    }
+    return total;
+}
+
+double Solver::total_mass() const {
+    const Impl& R = *impl_;
+    R.sync_ext();
+    double total = 0;
+    // (refinamiento) cada rejilla con su volumen de celda en unidades de la red base; las celdas cubiertas del padre
+    // (esclavas / muertas) no cuentan: su masa está en la rejilla fina.
+    for (int g = 0; g < R.n_grids(); ++g) {
+        const Impl& I = R.grid(g);
+        total += I.mass() * static_cast<double>(I.scale) * I.scale * I.scale;
     }
     return total;
 }

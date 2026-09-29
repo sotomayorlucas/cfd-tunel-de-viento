@@ -160,6 +160,14 @@ void VortexVolume::update(const FieldView& f) {
         while (mine > cur && !vmax_bits.compare_exchange_weak(cur, mine, std::memory_order_relaxed)) {}
     });
 
+    col_ux_ = by_ux;                 // col_ guarda u_x normalizada o la densidad: el render usa la LUT
+    col_map_ = csc.map;              // correspondiente a lo que se calculó aquí (no a params actuales)
+    build_bricks(std::bit_cast<float>(vmax_bits.load()));
+}
+
+// Ladrillos + estadísticas tras rellenar dens_/col_.
+void VortexVolume::build_bricks(float vmax) {
+    const int vx = vx_, vy = vy_, vz = vz_;
     // Ladrillos: máximo de densidad en [b·8-1, b·8+8] (margen para la trilineal).
     const int nb = bx_ * by_ * bz_;
     parallel_for(0, nb, 4, [&](i64 lo, i64 hi) {
@@ -177,12 +185,105 @@ void VortexVolume::update(const FieldView& f) {
             brick_[static_cast<usize>(b)] = m;
         }
     });
-    col_ux_ = by_ux;                 // col_ guarda u_x normalizada o la densidad: el render usa la LUT
-    col_map_ = csc.map;              // correspondiente a lo que se calculó aquí (no a params actuales)
     stats_.vx = vx; stats_.vy = vy; stats_.vz = vz;
     stats_.bricks = static_cast<usize>(nb);
-    stats_.max_value = std::bit_cast<float>(vmax_bits.load());
+    stats_.max_value = vmax;
     count_bricks();
+}
+
+// Refinamiento local: Q/|ω| y u_x en cada rejilla (sus celdas; Q/|ω| en unidades de la base) y, por vóxel de la rejilla de
+// volumen de la base, la media de las celdas de la rejilla más fina que contiene su centro ((ds/scale)³ submuestras por
+// vóxel: exactamente las celdas finas que caen dentro; en la base, las ds³ de siempre).
+void VortexVolume::update(const MultiField& m) {
+    if (m.n <= 1) { update(m.base()); return; }
+    const FieldView& f = m.base();
+    CFD_CHECK(f.valid() && f.flags != nullptr, "VortexVolume: campo sin datos o sin flags");
+    const int ds = params.downsample >= 2 ? 2 : 1;
+    const int vx = max_(f.nx / ds, 2), vy = max_(f.ny / ds, 2), vz = max_(f.nz / ds, 2);
+    const usize N = static_cast<usize>(vx) * static_cast<usize>(vy) * static_cast<usize>(vz);
+    if (vx != vx_ || vy != vy_ || vz != vz_ || ds != ds_ || dens_.size() != N) {
+        vx_ = vx; vy_ = vy; vz_ = vz; ds_ = ds;
+        dens_.resize(N); col_.resize(N);
+        bx_ = (vx + k_brick - 1) / k_brick; by_ = (vy + k_brick - 1) / k_brick; bz_ = (vz + k_brick - 1) / k_brick;
+        brick_.resize(static_cast<usize>(bx_) * static_cast<usize>(by_) * static_cast<usize>(bz_));
+    }
+    const Quantity q = params.field == VolumeField::Vorticity ? Quantity::Vorticity : Quantity::QCriterion;
+    full_ = max_(params.full, 1e-12f);
+    const float kq = 255.0f / full_;
+    const bool by_ux = params.color_by == VolumeColor::Streamwise;
+    const ColorScale csc = params.color_scale;
+    const float inv_u = 1.0f / f.u_inf;
+    const bool near_wall = params.hide_near_wall;
+    // 1) Por rejilla: magnitud (NaN en sólidos / junto a pared) y u_x (0 en sólidos).
+    for (int g = 0; g < m.n; ++g) {
+        const FieldView& G = m.g[g].f;
+        const usize ng = static_cast<usize>(G.nx) * static_cast<usize>(G.ny) * static_cast<usize>(G.nz);
+        if (gq_[g].size() < ng) { gq_[g].resize(ng); gu_[g].resize(ng); }
+        const float ks = quantity_grid_scale(q, m.g[g].scale);
+        float* Q = gq_[g].data();
+        float* U = gu_[g].data();
+        parallel_for(0, static_cast<i64>(G.ny) * G.nz, 4, [&](i64 lo, i64 hi) {
+            for (i64 r = lo; r < hi; ++r) {
+                const int y = static_cast<int>(r % G.ny), z = static_cast<int>(r / G.ny);
+                float* row = Q + static_cast<usize>(r) * static_cast<usize>(G.nx);
+                detail::quantity_row(G, q, y, z, row);
+                if (near_wall) detail::mask_near_wall(G, y, z, row);
+                const usize b = static_cast<usize>(r) * static_cast<usize>(G.nx);
+                for (int x = 0; x < G.nx; ++x) {
+                    row[x] *= ks;
+                    U[b + static_cast<usize>(x)] = (G.flags[b + static_cast<usize>(x)] & lbm::kSolid) ? 0.0f : G.ux[b + static_cast<usize>(x)];
+                }
+            }
+        });
+    }
+    // 2) Vóxeles.
+    std::atomic<u32> vmax_bits{0};
+    parallel_for(0, static_cast<i64>(vy) * vz, 2, [&](i64 lo, i64 hi) {
+        float local_max = 0.0f;
+        for (i64 r = lo; r < hi; ++r) {
+            const int yv = static_cast<int>(r % vy), zv = static_cast<int>(r / vy);
+            const usize vo = static_cast<usize>(vx) * static_cast<usize>(r);
+            u8* CFD_RESTRICT dd = dens_.data() + vo;
+            u8* CFD_RESTRICT cc = col_.data() + vo;
+            for (int xv = 0; xv < vx; ++xv) {
+                const Vec3 c0((static_cast<float>(xv) + 0.5f) * ds - 0.5f, (static_cast<float>(yv) + 0.5f) * ds - 0.5f, (static_cast<float>(zv) + 0.5f) * ds - 0.5f);
+                const int g = m.finest(c0);
+                const GridField& G = m.g[g];
+                const int sn = max_(1, static_cast<int>(std::lround(static_cast<float>(ds) / G.scale)));   // submuestras por eje
+                const float hs = static_cast<float>(ds) / static_cast<float>(sn);
+                const float* Q = gq_[g].data();
+                const float* U = gu_[g].data();
+                float s = 0.0f, su = 0.0f;
+                for (int k = 0; k < sn; ++k)
+                    for (int j = 0; j < sn; ++j)
+                        for (int i = 0; i < sn; ++i) {
+                            const Vec3 pb = c0 + Vec3((static_cast<float>(i) + 0.5f) * hs - 0.5f * ds, (static_cast<float>(j) + 0.5f) * hs - 0.5f * ds,
+                                                      (static_cast<float>(k) + 0.5f) * hs - 0.5f * ds);
+                            const Vec3 pg = g ? G.to_grid(pb) : pb;
+                            const int xi = clamp_(static_cast<int>(std::lround(pg.x)), 0, G.f.nx - 1);
+                            const int yi = clamp_(static_cast<int>(std::lround(pg.y)), 0, G.f.ny - 1);
+                            const int zi = clamp_(static_cast<int>(std::lround(pg.z)), 0, G.f.nz - 1);
+                            const usize n = G.f.index(xi, yi, zi);
+                            const float v = Q[n];
+                            s += v == v ? v : 0.0f;
+                            su += U[n];
+                        }
+                const float inv = 1.0f / static_cast<float>(sn * sn * sn);
+                s *= inv;
+                local_max = max_(local_max, s);
+                const float dq = s * kq;
+                dd[xv] = static_cast<u8>(dq > 0.0f ? min_(dq, 255.0f) + 0.5f : 0.0f);
+                const float tc = by_ux ? saturate(csc.normalize(su * inv * inv_u)) : 0.0f;
+                cc[xv] = by_ux ? static_cast<u8>((tc == tc ? tc : 0.0f) * 255.0f + 0.5f) : dd[xv];
+            }
+        }
+        u32 cur = vmax_bits.load(std::memory_order_relaxed);
+        const u32 mine = std::bit_cast<u32>(max_(local_max, 0.0f));
+        while (mine > cur && !vmax_bits.compare_exchange_weak(cur, mine, std::memory_order_relaxed)) {}
+    });
+    col_ux_ = by_ux;
+    col_map_ = csc.map;
+    build_bricks(std::bit_cast<float>(vmax_bits.load()));
 }
 
 // Cuenta los ladrillos ocupados para el umbral actual y su caja envolvente (≤ unos miles

@@ -88,6 +88,34 @@ enum class WallModel : u8 { None, LogLaw, Slip };
 //                 Verificado contra una referencia independiente A-B (tests/test_lbm.cpp, 2h-2j): |dρ|, |du| ~1e-7.
 enum class BounceBack : u8 { Implicit, Interpolated };
 
+// ---- Refinamiento local por bloques (lbm/refine.cpp; docs/FISICA.md §1.6) ------------------------------------
+// Una caja fina cubre un bloque de celdas [lo, hi] (inclusive) de su rejilla PADRE con celdas de la mitad de tamaño
+// (2:1, centradas: cada celda del padre se parte en 2×2×2) y avanza 2 subpasos por paso del padre (escalado acústico:
+// u de red igual en todos los niveles, ν_red ×2 por nivel). La rejilla fina lleva una capa FANTASMA alrededor (sus
+// poblaciones post-colisión se reconstruyen en cada subpaso a partir de ρ, u y del tensor de no equilibrio
+// reescalado, interpolados en espacio —trilineal— y en tiempo) y el padre recibe en su capa de celdas cubiertas
+// junto a la interfaz la media (restricción) de las 8 celdas finas. Las cajas se anidan (parent = otra caja).
+// Con suelo, una caja con lo[2] ≤ 1 se APOYA en él: su capa z = 0 es el suelo (con la cinta) y no hay fantasmas abajo.
+// init() normaliza las cajas (márgenes ≥ 3 celdas del padre a sus caras, 2(hi−lo+1)+2 múltiplo de 8 en x) y
+// comprueba que las hermanas no se toquen (separación ≥ 6 celdas del padre).
+struct LevelBox {
+    int parent = 0;                            // rejilla padre: 0 = red base, k = caja k−1 (las padres van antes)
+    int lo[3] = {0, 0, 0}, hi[3] = {-1, -1, -1};   // celdas del PADRE cubiertas (inclusive)
+};
+inline constexpr int k_max_boxes = 8;
+
+// Descripción de una rejilla (0 = red base, g ≥ 1 = caja g−1).
+struct GridInfo {
+    int nx = 0, ny = 0, nz = 0;
+    int parent = -1, depth = 0;
+    float scale = 1.0f;          // dx de la rejilla / dx de la red base (= 2^−depth)
+    Vec3 org{0, 0, 0};           // centro de su celda (0,0,0) en celdas de la red base
+    bool ground = false;         // apoyada en el suelo (su capa z = 0 es el suelo)
+    LevelBox box;                // (g ≥ 1) caja normalizada, en celdas del padre
+    Aabb inner;                  // región propia (sin la capa fantasma) en celdas de la red base: caras de las celdas cubiertas
+    usize cells() const { return static_cast<usize>(nx) * static_cast<usize>(ny) * static_cast<usize>(nz); }
+};
+
 // Distancia con signo a la superficie REAL del sólido (en celdas, < 0 dentro), en un punto de la red
 // (coordenadas de celda). Debe ser segura entre hilos y seguir viva mientras el solver la use (hasta el
 // siguiente set_geometry: set_wall_motion/set_ground también reconstruyen los enlaces).
@@ -130,6 +158,9 @@ struct Config {
     // +0.82). Medido (docs/FISICA.md §1.5): 6-8 celdas recuperan las fuerzas y el campo lejano sigue limpio; con 12 el
     // ruido empieza a reaparecer junto al coche y con 24 vuelve. 0 = RR en todo el dominio.
     int rr_wall_layer = 8;
+    // ---- Refinamiento local (ver LevelBox). 0 cajas = red uniforme (la ruta de siempre, sin coste añadido). ----
+    int n_boxes = 0;
+    LevelBox boxes[k_max_boxes] = {};
 };
 
 // Movimiento de pared en unidades de red (igual que LatticeMap::LatticeMotion).
@@ -281,8 +312,29 @@ public:
     // Campos macro que devuelve field() (memoria del backend); nullptr = los propios.
     void set_field_override(const float* rho, const float* ux, const float* uy, const float* uz);
 
+    // ---- Refinamiento local (Config::boxes). Sin cajas: grids() = 1 y todo lo de abajo describe la red base. ----
+    // Con cajas: step(n) avanza n pasos de la red base (2^nivel subpasos en cada rejilla fina); forces*() suman
+    // todas las rejillas en unidades de la red base (cada enlace de pared cuenta en UNA rejilla: la más fina que lo
+    // contiene); field() es la red base con las celdas cubiertas rellenas con la media de las finas;
+    // total_mass() suma todas las rejillas con su volumen de celda; last_mlups() son MLUPS "equivalentes"
+    // (actualizaciones de celda de todas las rejillas por segundo). Las velocidades de pared (set_wall_motion) y la
+    // referencia de momentos se dan en unidades de la red base (el solver las pasa a cada rejilla).
+    int grids() const;
+    GridInfo grid_info(int g) const;
+    // Geometría de la rejilla g ≥ 1 (solid_id de nx·ny·nz de esa rejilla, sdf en sus celdas). g = 0 ≡ set_geometry.
+    // Las celdas de las caras de una rejilla fina que no son sólidas son fantasmas (el solver las gestiona).
+    void set_grid_geometry(int g, const u8* solid_id, const WallSdf& sdf);
+    // Campos macro de la rejilla g (último paso macro): la capa fantasma lleva los valores interpolados y sus flags
+    // de visualización son de fluido; las celdas cubiertas por una rejilla más fina, la media de sus 8 celdas.
+    FieldView grid_field(int g) const;
+    double last_iface_seconds() const;         // tiempo de las pasadas de interfaz del último step()
+    // Normaliza Config::boxes como init() (márgenes, múltiplo de 8, apoyo en el suelo; en su sitio): para planificar cajas
+    // anidadas (las de un nivel se expresan en celdas de su padre ya normalizado).
+    static void normalize_boxes(Config& c);
+
+    struct Impl;   // estado interno (opaco fuera del módulo: lbm/solver_impl.hpp)
+
 private:
-    struct Impl;
     Impl* impl_;
 };
 

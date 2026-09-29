@@ -185,9 +185,28 @@ void App::build_panel(Rect pr) {
         if (ui_preset != static_cast<int>(sim.cfg.preset) || sim.cfg.cells) {
             if (U.button("Aplicar resolución (reinicia el flujo)", ui::ButtonKind::Primary)) { want_reinit = true; want_res_apply = true; }
         }
-        U.value("Malla", "%d × %d × %d", sim.dom.nx, sim.dom.ny, sim.dom.nz);
-        U.value("Celdas", "%.2f M", static_cast<double>(sim.dom.cells()) * 1e-6);
+        {
+            // Refinamiento local (lbm/refine.cpp, docs/FISICA.md §1.6): cajas finas 2:1 anidadas.
+            static const char* const k_refine_names[4] = {"Auto", "0", "1", "2"};
+            int rf = clamp_(ui_refine + 1, 0, 3);
+            U.label("Refinamiento local (niveles finos)", st.text_dim);
+            if (U.segmented("##refine", k_refine_names, 4, &rf)) ui_refine = rf - 1;
+            U.tooltip("Cajas de celdas 2 y 4 veces más finas (2:1 anidadas) alrededor del objeto y, en los F1, de los alerones y "
+                      "el fondo. El presupuesto de la resolución cubre red base + cajas finas; las finas dan 2 (nivel 1) o 4 "
+                      "(nivel 2) subpasos por paso. Auto: 2 en los F1 (1 en Rápida), 0 en el resto. La iGPU no lo admite.");
+            if (ui_refine != sim.cfg.refine)
+                if (U.button("Aplicar refinamiento (reinicia el flujo)", ui::ButtonKind::Primary)) want_reinit = true;
+        }
+        U.value(sim.levels.empty() ? "Malla" : "Malla (red base)", "%d × %d × %d", sim.dom.nx, sim.dom.ny, sim.dom.nz);
+        U.value(sim.levels.empty() ? "Celdas" : "Celdas (base / total)", sim.levels.empty() ? "%.2f M" : "%.2f / %.2f M",
+                static_cast<double>(sim.dom.cells()) * 1e-6, static_cast<double>(sim.total_cells) * 1e-6);
         U.value("dx", "%.1f mm", static_cast<double>(sim.dom.dx * 1e3f));
+        for (usize i = 0; i < sim.levels.size(); ++i) {
+            const LevelPlan& L = sim.levels[i];
+            char lbl[64];
+            std::snprintf(lbl, sizeof lbl, "Nivel %d: %s", L.depth, L.name);
+            U.value(lbl, "%.2f M · dx %.1f mm", static_cast<double>(L.cells()) * 1e-6, static_cast<double>(L.dx * 1e3f));
+        }
         U.value("Memoria del solver", "%.0f MB", static_cast<double>(sim.solver.memory_bytes()) / 1048576.0);
         U.value("Bloqueo frontal", "%.1f %%", static_cast<double>(sim.dom.blockage * 100.0f));
         if (sim.dom.design_dx > 0.0f && sim.dom.dx > sim.dom.design_dx * 1.02f && (mask & (models::P_FrontFlap | models::P_RearFlap)))
@@ -207,6 +226,7 @@ void App::build_panel(Rect pr) {
                       "con SPIR-V generado por el propio programa); la CPU queda libre para dibujar el cuadro anterior mientras la "
                       "GPU calcula el siguiente. Mismos resultados (FP32 ~1e-6; FP16S dentro de su redondeo).");
             if (!sim.gpu_error.empty()) U.text_wrapped_colored(st.warn, "iGPU no disponible: %s", sim.gpu_error.c_str());
+            else if (!sim.levels.empty()) U.text_colored(st.text_dim, "iGPU: sólo sin refinamiento local (Refinamiento: 0)");
         }
         float cs = sim.cfg.cs;
         if (U.slider_float("LES Cs", &cs, 0.0f, 0.3f, "%.2f")) { sim.cfg.cs = cs; sim.solver.set_smagorinsky(cs); }
@@ -317,6 +337,10 @@ void App::build_panel(Rect pr) {
         U.row(2);
         U.checkbox("Túnel (alambre)", &v.wire);
         U.checkbox("Leyendas", &v.legends);
+        if (!sim.levels.empty()) {
+            U.checkbox("Cajas de refinamiento", &v.level_boxes);
+            U.tooltip("Regiones de las rejillas finas (alambre): cian = nivel 1, ámbar = nivel 2.");
+        }
         U.row(2);
         U.checkbox("Oclusión (SSAO)", &v.ssao);
         U.checkbox("Antialias (FXAA)", &v.fxaa);
@@ -730,8 +754,13 @@ void App::draw_overlay(Rect vp) {
         line(0xFFD0D6DEu, "%s (Δ %.1f %%) · %.2f pasos de flujo · paso %llu", sim.converged ? "Convergido" : "Convergiendo",
              static_cast<double>(min_(sim.conv_rel, 9.99f) * 100.0f), static_cast<double>(sim.flow_throughs()),
              static_cast<unsigned long long>(sim.solver.steps()));
-        line(0xFF9AA3B2u, "Re red %s (real %s) · dx %.1f mm · suelo: %s", fmt_si(sim.re_lattice(), 2).s, fmt_si(sim.re_real(), 2).s,
-             static_cast<double>(sim.dom.dx * 1e3f), k_ground_names[static_cast<int>(sim.cfg.ground)]);
+        if (sim.levels.empty())
+            line(0xFF9AA3B2u, "Re red %s (real %s) · dx %.1f mm · suelo: %s", fmt_si(sim.re_lattice(), 2).s, fmt_si(sim.re_real(), 2).s,
+                 static_cast<double>(sim.dom.dx * 1e3f), k_ground_names[static_cast<int>(sim.cfg.ground)]);
+        else
+            line(0xFF9AA3B2u, "Re red %s (real %s) · dx %.1f → %.1f mm (%d niveles finos) · suelo: %s", fmt_si(sim.re_lattice(), 2).s,
+                 fmt_si(sim.re_real(), 2).s, static_cast<double>(sim.dom.dx * 1e3f), static_cast<double>(sim.levels.back().dx * 1e3f),
+                 sim.refine_levels(), k_ground_names[static_cast<int>(sim.cfg.ground)]);
         if (sim.is_car() && sim.ride_limited)
             line(0xFFFFB547u, "Altura efectiva (resolución): %.0f / %.0f mm (pedida %.0f / %.0f)", static_cast<double>(sim.ride_eff_front_mm),
                  static_cast<double>(sim.ride_eff_rear_mm), static_cast<double>(sim.params.ride_front_mm), static_cast<double>(sim.params.ride_rear_mm));
@@ -847,13 +876,20 @@ void App::draw_overlay(Rect vp) {
         std::snprintf(rb, sizeof rb, "%.0f FPS · %d pasos/cuadro · %.0f MLUPS · sim %.1f · render %.1f ms", perf.fps.v, perf.steps_per_frame,
                       perf.mlups.v, perf.sim_ms.v, perf.render_ms.v);
         int rw = render::text_width(rb);
-        std::snprintf(b, sizeof b, "%s  %s · %.2f M celdas (%d×%d×%d) · dx %.1f mm · %s · ν %.1e · Cs %.2f · %s",
-                      paused ? "PAUSA" : "▶", preset_name(sim.cfg.preset), static_cast<double>(sim.dom.cells()) * 1e-6, sim.dom.nx, sim.dom.ny,
-                      sim.dom.nz, static_cast<double>(sim.dom.dx * 1e3f), sim.cfg.fp32 ? "FP32" : "FP16S", static_cast<double>(sim.nu),
-                      static_cast<double>(sim.cfg.cs), cam_view_name(cam_view));
+        const double dx_fine = (sim.levels.empty() ? sim.dom.dx : sim.levels.back().dx) * 1e3;
+        if (sim.levels.empty())
+            std::snprintf(b, sizeof b, "%s  %s · %.2f M celdas (%d×%d×%d) · dx %.1f mm · %s · ν %.1e · Cs %.2f · %s",
+                          paused ? "PAUSA" : "▶", preset_name(sim.cfg.preset), static_cast<double>(sim.dom.cells()) * 1e-6, sim.dom.nx, sim.dom.ny,
+                          sim.dom.nz, static_cast<double>(sim.dom.dx * 1e3f), sim.cfg.fp32 ? "FP32" : "FP16S", static_cast<double>(sim.nu),
+                          static_cast<double>(sim.cfg.cs), cam_view_name(cam_view));
+        else
+            std::snprintf(b, sizeof b, "%s  %s · %.2f M celdas (base %d×%d×%d + %d cajas) · dx %.1f → %.1f mm · %s · ν %.1e · Cs %.2f · %s",
+                          paused ? "PAUSA" : "▶", preset_name(sim.cfg.preset), static_cast<double>(sim.total_cells) * 1e-6, sim.dom.nx, sim.dom.ny,
+                          sim.dom.nz, static_cast<int>(sim.levels.size()), static_cast<double>(sim.dom.dx * 1e3f), dx_fine,
+                          sim.cfg.fp32 ? "FP32" : "FP16S", static_cast<double>(sim.nu), static_cast<double>(sim.cfg.cs), cam_view_name(cam_view));
         if (render::text_width(b) + rw + 40 > sb.w) {
             std::snprintf(b, sizeof b, "%s  %s · %.2f M · dx %.1f mm · %s", paused ? "PAUSA" : "▶", preset_name(sim.cfg.preset),
-                          static_cast<double>(sim.dom.cells()) * 1e-6, static_cast<double>(sim.dom.dx * 1e3f), sim.cfg.fp32 ? "FP32" : "FP16S");
+                          static_cast<double>(sim.total_cells) * 1e-6, dx_fine, sim.cfg.fp32 ? "FP32" : "FP16S");
             std::snprintf(rb, sizeof rb, "%.0f FPS · %d pasos · %.0f MLUPS", perf.fps.v, perf.steps_per_frame, perf.mlups.v);
             rw = render::text_width(rb);
         }

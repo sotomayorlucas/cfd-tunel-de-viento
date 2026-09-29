@@ -159,6 +159,12 @@ cifras que la CPU a 2-3 cifras (σ_t(Cp) 40 celdas aguas arriba 0.0011 / 0.0010)
 
 ## Limitaciones
 
+* **Refinamiento local (docs/FISICA.md §1.6) NO portado**: `LbmGpu::attach` rechaza un solver con más de una
+  rejilla (mensaje "la iGPU no admite el refinamiento local…", `tests/test_refine.cpp` [8]) y el solver sigue en la
+  CPU; la app lo avisa en el panel (Solver: CPU/iGPU) y `--gpu` sólo se usa con `--refine 0`. Portarlo exigiría
+  los tres kernels por rejilla más las pasadas de interfaz (fantasmas, restricción, taps) y el orden recursivo de
+  subpasos: trabajo pendiente.
+
 * **Tiempo**: a Media la iGPU sola da ~650 MLUPS por paso completo con la colisión recursiva (753 con la
   proyección de 2.º orden anterior; el kernel de celdas pasa de ~7 a ~9 ms/paso: +20 % de instrucciones y
   algunos derrames de registros en el modo de 2 celdas por hilo, ver docs/opt/lbm.md §5) frente a ~870 de la

@@ -255,7 +255,9 @@ static void test_car() {
         s.cfg.cells = 400'000;
         s.cfg.ground = GroundMode::Moving;
         s.init();
-        const float g = app::Sim::k_gap_cells * s.dom.dx * 1000.0f;
+        // Con refinamiento local (defecto de los F1) el hueco mínimo usa la dx MÁS FINA bajo el fondo (dx_under).
+        CHECK(s.dx_under > 0.0f && s.dx_under <= s.dom.dx * 1.0001f, "dx bajo el fondo %.1f mm ≤ dx de la base %.1f mm", s.dx_under * 1e3f, s.dom.dx * 1e3f);
+        const float g = app::Sim::k_gap_cells * s.dx_under * 1000.0f;
         const float h = min_(s.params.ride_front_mm, s.params.ride_rear_mm);
         const float exp_front = s.params.ride_front_mm + std::pow(h * h * h * h + g * g * g * g, 0.25f) - h;
         CHECK(s.ride_limited && std::fabs(s.ride_eff_front_mm - exp_front) < 0.01f, "altura efectiva del. %.2f (esperado %.2f, g = %.1f mm)", s.ride_eff_front_mm, exp_front, g);
@@ -272,7 +274,7 @@ static void test_car() {
             prev = s.ride_eff_front_mm;
         }
         CHECK(mono, "la altura efectiva es monótona en la pedida");
-        std::printf("    f1_2022 dx %.1f mm: pedida 30/80 → efectiva (h⁴+g⁴)^¼ con g = %.0f mm; barrido monótono\n", s.dom.dx * 1e3, g);
+        std::printf("    f1_2022 dx %.1f mm (bajo el fondo %.1f mm): pedida 30/80 → efectiva (h⁴+g⁴)^¼ con g = %.0f mm; barrido monótono\n", s.dom.dx * 1e3, s.dx_under * 1e3, g);
         // Huella de contacto: ninguna celda de fluido encajonada entre una rueda y el suelo en z = 1..2.
         const auto& gs = s.built.scene.groups();
         int pockets = 0;

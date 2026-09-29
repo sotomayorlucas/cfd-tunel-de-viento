@@ -721,6 +721,12 @@ const LbmGpuTuning& LbmGpu::tuning() const { return impl_->tun; }
 
 bool LbmGpu::attach(lbm::Solver& s, std::string* err) {
     Impl& I = *impl_;
+    // El refinamiento local (varias rejillas anidadas, lbm/refine.cpp) no está portado a la iGPU: se rechaza limpiamente
+    // (el solver sigue en la CPU) en vez de avanzar sólo la red base.
+    if (s.grids() > 1) {
+        if (err) *err = "la iGPU no admite el refinamiento local (usar --refine 0 para el backend iGPU)";
+        return false;
+    }
     if (!I.ctx.ok() && !init(err)) return false;
     if (I.s && I.s != &s) detach();
     I.s = &s;
